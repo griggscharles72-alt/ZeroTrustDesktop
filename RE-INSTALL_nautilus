@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+
+
+def run(cmd, sudo=False):
+    """
+    Run a system command safely.
+    """
+    if sudo:
+        cmd = ["sudo"] + cmd
+
+    print(f"\n>>> Running: {' '.join(cmd)}\n")
+
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\nCommand failed: {e}")
+        sys.exit(1)
+
+
+def fix_nautilus():
+    print("Fixing Nautilus (file manager)...")
+
+    run(["apt", "update"], sudo=True)
+    run(["apt", "install", "--reinstall", "-y", "nautilus"], sudo=True)
+if __name__ == "__main__":
+    fix_nautilus()
