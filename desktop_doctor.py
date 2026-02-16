@@ -1,120 +1,150 @@
 #!/usr/bin/env python3
 
-import os
-import pathlib
 import subprocess
+import os
 import shutil
-import stat
-
-HOME = pathlib.Path.home()
-DESKTOP = HOME / "Desktop"
-
-def section(title):
-    print("\n" + "=" * 50)
-    print(title)
-    print("=" * 50)
+from pathlib import Path
 
 def run(cmd):
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return result.stdout.strip(), result.stderr.strip()
-    except Exception as e:
-        return "", str(e)
+        return result.stdout.strip()
+    except:
+        return "ERROR"
 
-section("PATH CHECK")
+def section(title):
+    print("\n" + "="*60)
+    print(title)
+    print("="*60)
 
-print("Desktop path:", DESKTOP)
 
-if DESKTOP.exists():
-    print("✔ Desktop exists")
+# ------------------------------------------------
+section("SYSTEM INFO")
+
+print(run("uname -a"))
+print("User:", os.getenv("USER"))
+print("Home:", Path.home())
+
+
+# ------------------------------------------------
+section("CPU / MEMORY")
+
+print(run("lscpu | head -n 20"))
+print(run("free -h"))
+
+
+# ------------------------------------------------
+section("DISK STATUS")
+
+print(run("lsblk"))
+print(run("df -h"))
+print(run("mount | grep '^/dev'"))
+
+
+# ------------------------------------------------
+section("ENCRYPTION CHECK")
+
+print(run("lsblk -f | grep crypt"))
+print(run("sudo cryptsetup status $(lsblk -o NAME,TYPE | grep crypt | awk '{print $1}' | head -n1) 2>/dev/null"))
+
+
+# ------------------------------------------------
+section("NETWORK")
+
+print(run("ip a"))
+print(run("ip route"))
+print(run("resolvectl status | grep DNS"))
+
+
+# ------------------------------------------------
+section("VPN STATUS")
+
+ip = run("curl -s ifconfig.me")
+org = run("curl -s https://ipinfo.io/org")
+
+print("Public IP:", ip)
+print("Org:", org)
+
+if "Proton" in org:
+    print("VPN: ACTIVE")
 else:
-    print("✘ Desktop missing")
-    exit()
+    print("VPN: NOT DETECTED")
 
-if DESKTOP.is_dir():
-    print("✔ Is directory")
-else:
-    print("✘ Not a directory")
+print(run("ip a | grep proton"))
 
-section("PERMISSION CHECK")
 
-st = DESKTOP.stat()
+# ------------------------------------------------
+section("FIREWALL")
 
-owner_ok = (st.st_uid == os.getuid())
+print(run("sudo ufw status"))
+print(run("sudo iptables -L | head -n 20"))
 
-print("Owner UID:", st.st_uid)
-print("Your UID:", os.getuid())
 
-if owner_ok:
-    print("✔ Ownership correct")
-else:
-    print("✘ Ownership mismatch → possible fix:")
-    print(f"  sudo chown -R {os.getlogin()}:{os.getlogin()} {DESKTOP}")
+# ------------------------------------------------
+section("SECURITY SERVICES")
 
-perms = stat.filemode(st.st_mode)
-print("Permissions:", perms)
+services = ["ufw", "fail2ban", "auditd"]
 
-if os.access(DESKTOP, os.R_OK):
-    print("✔ Read access")
-else:
-    print("✘ No read access")
+for s in services:
+    status = run(f"systemctl is-active {s}")
+    print(f"{s}: {status}")
 
-section("CONTENT CHECK")
 
-try:
-    items = list(DESKTOP.iterdir())
-    print(f"Items found: {len(items)}")
-    for i in items[:10]:
-        print(" -", i)
-except Exception as e:
-    print("✘ Cannot list contents:", e)
+# ------------------------------------------------
+section("FAILED SERVICES")
 
-section("DISK CHECK")
+print(run("systemctl --failed"))
 
-stdout, stderr = run("df -h ~")
-print(stdout)
 
-section("FILE MANAGER CHECK")
+# ------------------------------------------------
+section("PYTHON")
 
-fm = shutil.which("nautilus") or shutil.which("dolphin") or shutil.which("thunar")
+print(run("python3 --version"))
+print(run("pip3 --version"))
+print(run("which python3"))
+print(run("pipx --version"))
 
-if fm:
-    print("File manager found:", fm)
-else:
-    print("✘ No file manager detected")
 
-section("XDG OPEN TEST")
+# ------------------------------------------------
+section("VS CODE")
 
-stdout, stderr = run(f"xdg-open {DESKTOP}")
+print("Code binary:", shutil.which("code"))
+print(run("code --version"))
+print(run("code --list-extensions"))
 
-if stderr:
-    print("xdg-open error:", stderr)
-else:
-    print("xdg-open command sent (may open window)")
 
-section("PROCESS CHECK")
+# ------------------------------------------------
+section("HARDWARE")
 
-stdout, _ = run("ps aux | grep -E 'nautilus|dolphin|thunar' | grep -v grep")
-print(stdout if stdout else "No file manager process running")
+print(run("lspci | head -n 20"))
+print(run("lsusb"))
 
-section("COMMON FIX SUGGESTIONS")
+
+# ------------------------------------------------
+section("TEMPERATURE / POWER")
+
+print(run("sensors 2>/dev/null"))
+print(run("upower -e 2>/dev/null"))
+
+
+# ------------------------------------------------
+section("PROCESS LOAD")
+
+print(run("top -b -n1 | head -n 20"))
+
+
+# ------------------------------------------------
+section("SUMMARY")
 
 print("""
-If Desktop won't open but script works:
+If everything shows:
 
-1. Restart file manager:
-   nautilus -q
+VPN ACTIVE
+No failed services
+Disk healthy
+Memory normal
 
-2. Reset permissions:
-   chmod 755 ~/Desktop
-
-3. Recreate Desktop:
-   mv ~/Desktop ~/Desktop_backup
-   mkdir ~/Desktop
-
-4. Check disk errors:
-   sudo dmesg | grep -i error
-
+System state = GOOD
 """)
 
-print("\nDone.")
+print("\nDR-PC COMPLETE")
