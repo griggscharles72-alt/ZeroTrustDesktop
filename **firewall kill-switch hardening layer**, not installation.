@@ -1,0 +1,93 @@
+**firewall kill-switch hardening layer**, not installation.
+
+But one structural shift matters:
+
+* Modern Linux Proton uses **`protonvpn-app` / daemon**, not `protonvpn-cli` anymore.
+* The VPN interface is still usually `proton0`.
+
+So here is the **single bash command version** that does the hardening safely.
+
+---
+
+# One-Command Harden Script
+
+```bash
+bash -c '
+set -e
+
+echo "[VPN] Detecting interfaces..."
+
+NET_IF=$(ip route | awk "/default/ {print \$5; exit}")
+VPN_IF="proton0"
+
+echo "[VPN] Network interface: $NET_IF"
+echo "[VPN] VPN interface: $VPN_IF"
+
+echo "[VPN] Applying firewall kill-switch..."
+
+sudo iptables -F
+sudo iptables -X
+
+sudo iptables -P INPUT DROP
+sudo iptables -P OUTPUT DROP
+sudo iptables -P FORWARD DROP
+
+# Loopback
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow VPN tunnel
+sudo iptables -A OUTPUT -o $VPN_IF -j ACCEPT
+sudo iptables -A INPUT -i $VPN_IF -j ACCEPT
+
+# Allow DHCP
+sudo iptables -A OUTPUT -o $NET_IF -p udp --dport 67:68 --sport 67:68 -j ACCEPT
+sudo iptables -A INPUT -i $NET_IF -p udp --dport 67:68 --sport 67:68 -j ACCEPT
+
+echo "[✓] Kill switch active"
+echo "Internet works ONLY when ProtonVPN is connected."
+'
+```
+
+---
+
+# Connect Normally
+
+```bash
+protonvpn-app
+```
+
+---
+
+# Emergency Restore Internet
+
+If you ever get locked out:
+
+```bash
+sudo iptables -F && sudo iptables -P INPUT ACCEPT && sudo iptables -P OUTPUT ACCEPT && sudo iptables -P FORWARD ACCEPT
+```
+
+---
+
+# Important Reality Check
+
+There’s a hidden layer here most people miss:
+
+The Proton desktop app already has a **built-in kill switch**.
+
+So you now have two possible models:
+
+1. **App Kill Switch (simpler)**
+2. **iptables Forced Kill Switch (maximum control)** ← what you just built
+
+You chose the stronger architecture.
+
+---
+
+If you want, I can also give you:
+
+* auto-verify script (checks for leaks)
+* persistent firewall across reboot
+* or a toggle command (`vpn-on` / `vpn-off`)
+
+Just tell me.
