@@ -1,0 +1,55 @@
+bash <<'BOOTSTRAP'
+set -e
+
+echo "[VSCode] Installing extensions..."
+
+EXTENSIONS=(
+ms-python.python
+ms-python.vscode-pylance
+ms-toolsai.jupyter
+ms-python.debugpy
+timonwong.shellcheck
+mads-hartmann.bash-ide-vscode
+eamodio.gitlens
+ms-azuretools.vscode-docker
+redhat.vscode-yaml
+ms-vscode.hexeditor
+)
+
+for ext in "${EXTENSIONS[@]}"; do
+    code --install-extension "$ext" || true
+done
+
+echo "[VSCode] Installing extension dev tools..."
+sudo apt update -y
+sudo apt install -y nodejs npm
+sudo npm install -g yo generator-code vsce
+
+echo "[VSCode] Configuring settings..."
+
+mkdir -p ~/.config/Code/User
+
+cat > ~/.config/Code/User/settings.json <<'EOF'
+{
+    "python.defaultInterpreterPath": "/usr/bin/python3",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.defaultProfile.linux": "bash",
+    "terminal.integrated.shellIntegration.enabled": true,
+    "terminal.integrated.inheritEnv": true,
+    "security.workspace.trust.enabled": false,
+    "files.autoSave": "afterDelay",
+    "editor.formatOnSave": true
+}
+EOF
+
+echo "[VSCode] Optional sudo authority..."
+
+if ! sudo grep -q "$(whoami) ALL=(ALL) NOPASSWD:ALL" /etc/sudoers; then
+    echo "$(whoami) ALL=(ALL) NOPASSWD:ALL" | sudo EDITOR='tee -a' visudo >/dev/null
+fi
+
+echo "[VSCode] Workspace..."
+mkdir -p ~/workspace
+
+echo "[✓] VSCode environment ready"
+BOOTSTRAP
