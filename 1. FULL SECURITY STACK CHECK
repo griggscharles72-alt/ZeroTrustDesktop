@@ -46,3 +46,4 @@ ss -tulnp | grep LISTEN
 echo
 echo "========== COMPLETE =========="
 '
+sudo systemctl disable --now cups cups-browsed 2>/dev/null || true
