@@ -4,14 +4,34 @@ set -e
 echo "[VSCode] Installing extensions..."
 
 EXTENSIONS=(
+# Python core
 ms-python.python
 ms-python.vscode-pylance
-ms-toolsai.jupyter
 ms-python.debugpy
-timonwong.shellcheck
+ms-python.vscode-python-envs
+
+# Jupyter
+ms-toolsai.jupyter
+ms-toolsai.jupyter-keymap
+ms-toolsai.jupyter-renderers
+ms-toolsai.vscode-jupyter-cell-tags
+ms-toolsai.vscode-jupyter-slideshow
+
+# Bash / Shell
 mads-hartmann.bash-ide-vscode
-eamodio.gitlens
+timonwong.shellcheck
+foxundermoon.shell-format
+
+# Execution / Run control (prompts before execute)
+usernamehw.execute
+formulahendry.code-runner
+
+# Dev / Containers
 ms-azuretools.vscode-docker
+ms-azuretools.vscode-containers
+
+# Git / YAML / Hex
+eamodio.gitlens
 redhat.vscode-yaml
 ms-vscode.hexeditor
 )
@@ -33,12 +53,22 @@ cat > ~/.config/Code/User/settings.json <<'EOF'
 {
     "python.defaultInterpreterPath": "/usr/bin/python3",
     "python.terminal.activateEnvironment": true,
+
     "terminal.integrated.defaultProfile.linux": "bash",
     "terminal.integrated.shellIntegration.enabled": true,
     "terminal.integrated.inheritEnv": true,
+
     "security.workspace.trust.enabled": false,
+
     "files.autoSave": "afterDelay",
-    "editor.formatOnSave": true
+    "editor.formatOnSave": true,
+
+    "code-runner.runInTerminal": true,
+    "code-runner.saveFileBeforeRun": true,
+
+    "shellformat.flag": "-i 4",
+
+    "git.autofetch": true
 }
 EOF
 
