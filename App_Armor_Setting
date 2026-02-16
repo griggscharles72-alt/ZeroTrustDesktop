@@ -1,1 +1,46 @@
-sudo bash -c 'apt update && apt install -y apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra && systemctl enable --now apparmor && aa-enforce /etc/apparmor.d/* 2>/dev/null || true && aa-complain /etc/apparmor.d/code* 2>/dev/null || true && aa-complain /etc/apparmor.d/python* 2>/dev/null || true && aa-status'
+sudo bash -c '
+echo "========== SECURITY STACK SETUP + AUDIT =========="
+
+echo
+echo "[1] APPARMOR INSTALL / REPAIR"
+apt update
+apt install -y apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra
+
+systemctl enable --now apparmor
+
+echo
+echo "[2] PROFILE MODES"
+aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+
+# Keep development tools flexible
+aa-complain /etc/apparmor.d/code* 2>/dev/null || true
+aa-complain /etc/apparmor.d/python* 2>/dev/null || true
+
+echo
+echo "[3] APPARMOR STATUS"
+aa-status
+
+echo
+echo "[4] FIREWALL STATUS"
+ufw status verbose 2>/dev/null || echo "UFW not installed"
+
+echo
+echo "[5] OPEN PORTS"
+ss -tulnp
+
+echo
+echo "[6] FAIL2BAN STATUS"
+systemctl is-active fail2ban && echo "Fail2Ban running" || echo "Fail2Ban NOT running"
+fail2ban-client status 2>/dev/null || true
+
+echo
+echo "[7] VPN PACKAGES"
+dpkg -l | grep -i proton || echo "Proton VPN not installed"
+
+echo
+echo "[8] SERVICES LISTENING"
+lsof -i -P -n | grep LISTEN || true
+
+echo
+echo "========== COMPLETE =========="
+'
