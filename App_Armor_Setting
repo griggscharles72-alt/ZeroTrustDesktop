@@ -1,0 +1,1 @@
+sudo bash -c 'apt update && apt install -y apparmor apparmor-utils apparmor-profiles apparmor-profiles-extra && systemctl enable --now apparmor && aa-enforce /etc/apparmor.d/* 2>/dev/null || true && aa-complain /etc/apparmor.d/code* 2>/dev/null || true && aa-complain /etc/apparmor.d/python* 2>/dev/null || true && aa-status'
