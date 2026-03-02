@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+Zero Python Provision (ZPP) — Product Edition
+Version: 0.0.1
+Suite repo umbrella: Zero Trust Desktop (ZTD)
+
+What this is
+------------
+A Python-first workstation provisioner for Ubuntu/Debian that installs what you need,
+leaves alone what you already have, and logs everything so it’s auditable.
+
+Design principles
+-----------------
+- Idempotent: re-running is safe.
+- Minimal assumptions: Debian/Ubuntu only.
+- No removals by default.
+- Behavior-changing actions (services, firewall, printing) are explicit flags.
+- Operates as a single self-contained Python file (easy to paste, store, ship).
+
+Quickstart
+----------
+  python3 zero_python_provision.py bootstrap --yes --profile dev
+  python3 zero_python_provision.py python --yes --venv --venv-libs --pipx-tools
+  python3 zero_python_provision.py verify
+
+Profiles
+--------
+- dev:    Python-ready developer baseline (Python + build + core)
+- secure: Adds security packages (ufw/fail2ban/auditd) but does NOT enable them unless asked
+- full:   Adds networking stack (wireguard/openvpn/tor/nginx) but does NOT enable services unless asked
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import platform
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple
+
+
+# -----------------------------
+# Versioning / Branding
+# -----------------------------
+APP_NAME = "Zero Python Provision"
+APP_ID = "zpp"
+SUITE_NAME = "Zero Trust Desktop"
+SUITE_ID = "ztd"
+VERSION = "0.0.1"
+
+
+# -----------------------------
+# Paths / Defaults
+# -----------------------------
+HOME = Path.home()
+STATE_DIR = HOME / ".local" / "state" / "zero-trust-desktop" / APP_ID
+LOG_DIR = STATE_DIR / "log"
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+PY_WORKDIR = HOME / "python-projects"
+PY_DEFAULT_VENV = PY_WORKDIR / "default"
+
+
+# -----------------------------
+# Package sets
+# -----------------------------
+PKGS_CORE = [
+    "ca-certificates", "curl", "wget", "git", "unzip", "zip", "tar",
+    "jq", "ripgrep", "tree", "htop", "net-tools",
+    "software-properties-common", "gnupg", "lsb-release", "apt-transport-https",
+]
+PKGS_BUILD = [
+    "build-essential", "gcc", "g++", "make", "dkms", "cmake", "pkg-config",
+    "openssl", "libssl-dev", "libffi-dev",
+]
+PKGS_SEC = ["ufw", "fail2ban", "auditd", "audispd-plugins"]
+PKGS_PY = ["python3", "python3-full", "python3-pip", "python3-venv", "python3-dev", "pipx"]
+PKGS_NET = ["tor", "nginx", "openvpn", "wireguard", "wireguard-tools", "network-manager-openvpn"]
+
+PIPX_TOOLS = ["virtualenv", "ipython", "httpie", "rich-cli"]
+VENV_LIBS = ["numpy", "pandas", "requests", "psutil", "rich", "flask", "fastapi", "uvicorn"]
+
+
+# -----------------------------
+# Data structures
+# -----------------------------
+@dataclass
+class Settings:
+    yes: bool
+    json: bool
+    upgrade: bool
+    profile: str
+    python_link: bool
+    pipx_tools: bool
+    venv: bool
+    venv_libs: bool
+    enable_services: bool
+    firewall_baseline: bool
+    disable_printing: bool
+    log_file: Path
+
+
+@dataclass
+class Event:
+    ts: str
+    level: str
+    msg: str
+    data: Optional[dict] = None
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def now_ts() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def write_append(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def emit(s: Settings, event: Event) -> None:
+    # Console output
+    if s.json:
+        print(json.dumps(asdict(event), ensure_ascii=False))
+    else:
+        print(f"[{event.ts}] {event.level}: {event.msg}")
+
+    # File output (always structured JSONL)
+    write_append(s.log_file, json.dumps(asdict(event), ensure_ascii=False) + "\n")
+
+
+def info(s: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(s, Event(ts=now_ts(), level="INFO", msg=msg, data=data))
+
+
+def warn(s: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(s, Event(ts=now_ts(), level="WARN", msg=msg, data=data))
+
+
+def err(s: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(s, Event(ts=now_ts(), level="ERROR", msg=msg, data=data))
+
+
+def run(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
+    # Always log the command
+    info(s, "$ " + " ".join(cmd))
+    p = subprocess.run(cmd, text=True, capture_output=True)
+    if check and p.returncode != 0:
+        err(s, "Command failed", {"rc": p.returncode, "cmd": cmd, "stderr": p.stderr.strip()})
+        raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
+    return p.returncode, p.stdout, p.stderr
+
+
+def sudo(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
+    return run(s, ["sudo"] + cmd, check=check)
+
+
+def require_debian_like(s: Settings) -> None:
+    if not (Path("/etc/os-release").exists() and have("apt-get") and have("dpkg")):
+        err(s, "Unsupported platform. Debian/Ubuntu with apt-get/dpkg required.")
+        raise SystemExit(2)
+
+
+def dpkg_installed(pkg: str) -> bool:
+    p = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return p.returncode == 0
+
+
+# -----------------------------
+# Core operations
+# -----------------------------
+def apt_update(s: Settings) -> None:
+    args = ["apt-get", "update"]
+    if s.yes:
+        args.append("-y")
+    sudo(s, args)
+
+
+def apt_upgrade(s: Settings) -> None:
+    args = ["apt-get", "upgrade"]
+    if s.yes:
+        args.append("-y")
+    sudo(s, args)
+
+
+def apt_install_missing(s: Settings, pkgs: Iterable[str]) -> None:
+    pkgs = list(pkgs)
+    missing = [p for p in pkgs if not dpkg_installed(p)]
+    for p in pkgs:
+        if p in missing:
+            info(s, f"Installing missing package: {p}")
+        else:
+            info(s, f"Already installed: {p}")
+
+    if not missing:
+        return
+
+    args = ["apt-get", "install"]
+    if s.yes:
+        args.append("-y")
+    args += missing
+    sudo(s, args)
+
+
+def ensure_local_bin_path(s: Settings) -> None:
+    (HOME / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+    bashrc = HOME / ".bashrc"
+    line = 'export PATH="$HOME/.local/bin:$PATH"'
+    content = read_text(bashrc)
+    if line in content:
+        info(s, "~/.local/bin already present in ~/.bashrc")
+        return
+
+    # backup once per machine
+    backup = HOME / f".bashrc.{APP_ID}.bak"
+    if bashrc.exists() and not backup.exists():
+        info(s, f"Backing up ~/.bashrc to {backup.name}")
+        backup.write_text(content, encoding="utf-8")
+
+    info(s, "Appending ~/.local/bin PATH line to ~/.bashrc")
+    write_append(bashrc, "\n" + line + "\n")
+
+
+def ensure_python_symlink(s: Settings) -> None:
+    if not s.python_link:
+        return
+    if have("python"):
+        info(s, "python already exists on PATH")
+        return
+    if not have("python3"):
+        warn(s, "python3 not found yet (install Python packages first)")
+        return
+    info(s, "Creating /usr/local/bin/python -> /usr/bin/python3")
+    sudo(s, ["ln", "-sf", "/usr/bin/python3", "/usr/local/bin/python"], check=False)
+
+
+def pip_user_upgrade(s: Settings) -> None:
+    # Best-effort by design
+    info(s, "Upgrading pip/setuptools/wheel (user scope)")
+    subprocess.run(
+        ["python3", "-m", "pip", "install", "--user", "--upgrade", "pip", "setuptools", "wheel", "--break-system-packages"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def pipx_ensurepath(s: Settings) -> None:
+    info(s, "pipx ensurepath (best-effort)")
+    subprocess.run(["pipx", "ensurepath"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def pipx_install_tools(s: Settings) -> None:
+    if not s.pipx_tools:
+        return
+    for tool in PIPX_TOOLS:
+        info(s, f"pipx install (best-effort): {tool}")
+        subprocess.run(["pipx", "install", tool], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def ensure_default_venv(s: Settings) -> None:
+    if not s.venv:
+        return
+    info(s, f"Ensuring default venv exists: {PY_DEFAULT_VENV}")
+    if PY_DEFAULT_VENV.exists() and (PY_DEFAULT_VENV / "bin" / "python").exists():
+        info(s, "Default venv already exists")
+        return
+    PY_WORKDIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["python3", "-m", "venv", str(PY_DEFAULT_VENV)], check=False)
+
+
+def install_venv_libs(s: Settings) -> None:
+    if not s.venv_libs:
+        return
+    pip = PY_DEFAULT_VENV / "bin" / "pip"
+    if not pip.exists():
+        warn(s, "Venv pip not found; run with --venv first")
+        return
+    info(s, f"Installing libs into venv: {' '.join(VENV_LIBS)} (best-effort)")
+    subprocess.run([str(pip), "install", "-U", *VENV_LIBS], check=False)
+
+
+def enable_services(s: Settings) -> None:
+    if not s.enable_services:
+        return
+    services = ["ufw", "fail2ban", "auditd", "tor", "nginx"]
+    for name in services:
+        info(s, f"Enabling service: {name}")
+        sudo(s, ["systemctl", "enable", "--now", name], check=False)
+
+
+def firewall_baseline(s: Settings) -> None:
+    if not s.firewall_baseline:
+        return
+    info(s, "Applying ufw baseline (allow OpenSSH + enable)")
+    sudo(s, ["ufw", "allow", "OpenSSH"], check=False)
+    sudo(s, ["ufw", "--force", "enable"], check=False)
+
+
+def disable_printing(s: Settings) -> None:
+    if not s.disable_printing:
+        return
+    info(s, "Disabling printing services (cups, cups-browsed)")
+    sudo(s, ["systemctl", "disable", "--now", "cups", "cups-browsed"], check=False)
+
+
+def verify(s: Settings) -> None:
+    info(
+        s,
+        "Verification",
+        {
+            "app": APP_ID,
+            "app_name": APP_NAME,
+            "suite": SUITE_ID,
+            "suite_name": SUITE_NAME,
+            "version": VERSION,
+            "system": f"{platform.system()} {platform.release()}",
+            "arch": platform.machine(),
+            "python": sys.version.splitlines()[0],
+        },
+    )
+
+    cmds = [
+        ["python3", "--version"],
+        ["pip3", "--version"],
+        ["pipx", "--version"],
+        ["gcc", "--version"],
+        ["code", "--version"],
+    ]
+    for cmd in cmds:
+        exe = cmd[0]
+        if not have(exe):
+            warn(s, f"{exe} not found")
+            continue
+        p = subprocess.run(cmd, text=True, capture_output=True)
+        out = (p.stdout.strip() or p.stderr.strip()).splitlines()
+        first = out[0] if out else ""
+        info(s, f"{exe}: {first}")
+
+    if have("systemctl"):
+        subprocess.run(["systemctl", "--failed", "--no-pager"], check=False)
+
+
+# -----------------------------
+# Profile logic
+# -----------------------------
+def profile_packages(profile: str) -> List[str]:
+    profile = profile.lower()
+    if profile == "dev":
+        return PKGS_CORE + PKGS_BUILD + PKGS_PY
+    if profile == "secure":
+        return PKGS_CORE + PKGS_BUILD + PKGS_PY + PKGS_SEC
+    if profile == "full":
+        return PKGS_CORE + PKGS_BUILD + PKGS_PY + PKGS_SEC + PKGS_NET
+    # default fallback
+    return PKGS_PY
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="zero_python_provision.py", add_help=True)
+    p.add_argument("--version", action="store_true", help="Print version and exit")
+    p.add_argument("--json", action="store_true", help="Emit JSON to stdout (logs always JSONL)")
+    p.add_argument("--yes", action="store_true", help="Non-interactive apt (-y)")
+
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    # bootstrap
+    b = sub.add_parser("bootstrap", help="Provision packages based on a profile")
+    b.add_argument("--profile", choices=["dev", "secure", "full"], default="dev", help="Package profile")
+    b.add_argument("--upgrade", action="store_true", help="Run apt-get upgrade after update")
+    b.add_argument("--python-link", action="store_true", help="Create python->python3 symlink if python missing")
+    b.add_argument("--pipx-tools", action="store_true", help="Install common pipx tools")
+    b.add_argument("--venv", action="store_true", help="Create default venv (~/python-projects/default)")
+    b.add_argument("--venv-libs", action="store_true", help="Install common libs into default venv")
+    b.add_argument("--enable-services", action="store_true", help="Enable/start services (behavior change)")
+    b.add_argument("--firewall-baseline", action="store_true", help="Apply ufw baseline (behavior change)")
+    b.add_argument("--disable-printing", action="store_true", help="Disable cups services (behavior change)")
+
+    # python-only
+    py = sub.add_parser("python", help="Python-only actions (no system security toggles)")
+    py.add_argument("--upgrade", action="store_true", help="Run apt-get upgrade after update")
+    py.add_argument("--python-link", action="store_true", help="Create python->python3 symlink if python missing")
+    py.add_argument("--pipx-tools", action="store_true", help="Install common pipx tools")
+    py.add_argument("--venv", action="store_true", help="Create default venv")
+    py.add_argument("--venv-libs", action="store_true", help="Install venv libs")
+
+    # verify
+    sub.add_parser("verify", help="Show versions/status")
+
+    return p
+
+
+def make_settings(args: argparse.Namespace) -> Settings:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"{APP_ID}_{RUN_ID}.jsonl"
+
+    profile = getattr(args, "profile", "dev")
+
+    return Settings(
+        yes=bool(args.yes),
+        json=bool(args.json),
+        upgrade=bool(getattr(args, "upgrade", False)),
+        profile=str(profile),
+        python_link=bool(getattr(args, "python_link", False)),
+        pipx_tools=bool(getattr(args, "pipx_tools", False)),
+        venv=bool(getattr(args, "venv", False)),
+        venv_libs=bool(getattr(args, "venv_libs", False)),
+        enable_services=bool(getattr(args, "enable_services", False)),
+        firewall_baseline=bool(getattr(args, "firewall_baseline", False)),
+        disable_printing=bool(getattr(args, "disable_printing", False)),
+        log_file=log_file,
+    )
+
+
+def cmd_bootstrap(s: Settings) -> None:
+    require_debian_like(s)
+    info(s, f"{APP_NAME} bootstrap", {"version": VERSION, "profile": s.profile})
+
+    apt_update(s)
+    if s.upgrade:
+        apt_upgrade(s)
+
+    pkgs = profile_packages(s.profile)
+    apt_install_missing(s, pkgs)
+
+    ensure_local_bin_path(s)
+    pipx_ensurepath(s)
+    pip_user_upgrade(s)
+
+    ensure_python_symlink(s)
+    pipx_install_tools(s)
+    ensure_default_venv(s)
+    install_venv_libs(s)
+
+    enable_services(s)
+    firewall_baseline(s)
+    disable_printing(s)
+
+    verify(s)
+    info(s, "Bootstrap complete", {"log": str(s.log_file)})
+
+
+def cmd_python(s: Settings) -> None:
+    require_debian_like(s)
+    info(s, f"{APP_NAME} python", {"version": VERSION})
+
+    apt_update(s)
+    if s.upgrade:
+        apt_upgrade(s)
+
+    apt_install_missing(s, PKGS_PY)
+    ensure_local_bin_path(s)
+    pipx_ensurepath(s)
+    pip_user_upgrade(s)
+
+    ensure_python_symlink(s)
+    pipx_install_tools(s)
+    ensure_default_venv(s)
+    install_venv_libs(s)
+
+    verify(s)
+    info(s, "Python setup complete", {"log": str(s.log_file)})
+
+
+def cmd_verify(s: Settings) -> None:
+    require_debian_like(s)
+    verify(s)
+    info(s, "Verify complete", {"log": str(s.log_file)})
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"{APP_NAME} {VERSION} — suite: {SUITE_NAME} ({SUITE_ID})")
+        return 0
+
+    s = make_settings(args)
+
+    # default to bootstrap dev if no cmd
+    cmd = args.cmd or "bootstrap"
+    if cmd == "bootstrap":
+        cmd_bootstrap(s)
+    elif cmd == "python":
+        cmd_python(s)
+    elif cmd == "verify":
+        cmd_verify(s)
+    else:
+        err(s, f"Unknown command: {cmd}")
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
