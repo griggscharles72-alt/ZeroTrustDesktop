@@ -1,0 +1,354 @@
+cat > elliot_top50_install.sh <<'EOF'
+#!/usr/bin/env bash
+# Elliot Super Advanced Master — Top 50 Install Stack (Ubuntu 24.04+)
+# - Independent install blocks (fail -> continue)
+# - Retry + logging + verification
+# - FX optional (Ghost protocol + Matrix rain) isolated so it never breaks installs
+
+set -u
+set -o pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+# ---------- paths / logs ----------
+LOG_DIR="${LOG_DIR:-$HOME/.local/share/elliot-installer}"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/install_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ---------- helpers ----------
+log(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
+
+run_block() {
+  local name="$1"; shift
+  log "BLOCK: $name"
+  if "$@"; then
+    log "OK: $name"
+  else
+    log "FAIL: $name (continuing)"
+  fi
+  return 0
+}
+
+trap 'log "INTERRUPTED (Ctrl+C). Exiting."; exit 130' INT
+
+need_sudo() { sudo -v || return 1; }
+
+# retry wrapper for flaky network/repo moments
+retry() {
+  # retry <attempts> <sleep_seconds> -- command...
+  local attempts="$1"; shift
+  local delay="$1"; shift
+  local n=1
+  while true; do
+    if "$@"; then return 0; fi
+    if [ "$n" -ge "$attempts" ]; then return 1; fi
+    log "retry: attempt $n/$attempts failed; sleeping ${delay}s"
+    sleep "$delay"
+    n=$((n+1))
+  done
+}
+
+apt_update() { retry 3 3 sudo apt-get update -y; }
+
+apt_install() {
+  # lean install set; avoids recommends to reduce bloat
+  retry 2 2 sudo apt-get install -y --no-install-recommends "$@"
+}
+
+apt_install_full() {
+  # for GUI/heavier apps that may need recommends
+  retry 2 2 sudo apt-get install -y "$@"
+}
+
+ensure_universe() {
+  # ensure add-apt-repository exists before calling it
+  command -v add-apt-repository >/dev/null 2>&1 || return 0
+  sudo add-apt-repository -y universe >/dev/null 2>&1 || true
+}
+
+# ---------- FX MODULE (optional, safe) ----------
+FX_ENABLED="${FX_ENABLED:-1}"
+FX_SECONDS="${FX_SECONDS:-3}"
+FX_NAME="${FX_NAME:-ELLIOT}"
+
+fx_green() { printf "\033[32m%s\033[0m\n" "$*"; }
+fx_dim()   { printf "\033[2m%s\033[0m\n" "$*"; }
+fx_clear() { printf "\033[2J\033[H"; }
+fx_hide_cursor(){ printf "\033[?25l"; }
+fx_show_cursor(){ printf "\033[?25h"; }
+
+fx_requirements_ok() {
+  [ "${FX_ENABLED:-1}" = "1" ] || return 1
+  [ -t 1 ] || return 1
+  return 0
+}
+
+ghost_protocol_invoked() {
+  fx_requirements_ok || return 0
+  fx_clear
+  fx_hide_cursor
+  fx_green "Ghost protocol invoked."
+  sleep 2
+}
+
+# denser matrix effect fallback (no extra deps)
+matrix_rain_py() {
+  python3 - <<PY || true
+import sys,time,random,shutil
+name="${FX_NAME}"
+secs=float("${FX_SECONDS}")
+w,h = shutil.get_terminal_size((80,24))
+green="\033[32m"; reset="\033[0m"; clear="\033[2J\033[H"
+sys.stdout.write(clear)
+# track drops per column
+drops=[random.randint(0,h) for _ in range(w)]
+end=time.time()+secs
+while time.time()<end:
+    # occasional name injection on a row
+    inject = random.random()<0.30 and w>=len(name)+2
+    start = random.randint(0, max(0,w-len(name)-1)) if inject else 0
+
+    line=[" "] * w
+    # high density 0/1 with gaps
+    for i in range(w):
+        if random.random()<0.04:
+            line[i]=" "
+        else:
+            line[i]="1" if random.random()>0.5 else "0"
+    if inject:
+        for j,ch in enumerate(name):
+            line[start+j]=ch
+
+    sys.stdout.write(green + "".join(line) + reset + "\n")
+    sys.stdout.flush()
+    time.sleep(0.03)
+PY
+}
+
+matrix_rain() {
+  fx_requirements_ok || return 0
+
+  # Prefer cmatrix if available; uses timeout to auto-stop
+  if command -v cmatrix >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    timeout "${FX_SECONDS}" cmatrix -b -u 1 -C green >/dev/tty 2>/dev/null || true
+    return 0
+  fi
+
+  # Fallback to python if available
+  if command -v python3 >/dev/null 2>&1; then
+    matrix_rain_py
+    return 0
+  fi
+
+  # Ultra-safe fallback (no python, no cmatrix)
+  fx_dim "0101010101010101010101010101010101010101010101010101010101010101"
+  fx_dim "0101010101010101010101010101010101010101010101010101010101010101"
+  fx_dim "0101010101010101010101010101010101010101010101010101010101010101"
+  sleep 1
+}
+
+fx_transition() {
+  ghost_protocol_invoked || true
+  matrix_rain || true
+  fx_show_cursor || true
+}
+
+# ---------- start ----------
+log "Log file: $LOG_FILE"
+run_block "sudo auth" need_sudo
+
+# baseline update
+run_block "apt update" apt_update
+
+# Foundation (also provides add-apt-repository)
+run_block "foundation: certs/keys/download/build" apt_install \
+  coreutils ca-certificates gnupg software-properties-common curl wget build-essential unzip p7zip-full
+
+# enable universe after software-properties-common exists
+run_block "enable universe" ensure_universe
+run_block "apt update (post-universe)" apt_update
+
+fx_transition || true
+
+# Optional FX enhancer
+run_block "visual: install cmatrix (optional)" apt_install cmatrix
+fx_transition || true
+
+# ---------- TOP-50 installs ----------
+run_block "TOP50: python baseline" apt_install python3 python3-venv python3-pip pipx
+fx_transition || true
+
+run_block "TOP50: terminal power" apt_install tmux ripgrep fd-find jq bat fzf tree
+fx_transition || true
+
+run_block "TOP50: monitors + debug" apt_install btop htop iotop ncdu lsof strace gdb
+fx_transition || true
+
+run_block "TOP50: networking base" apt_install openssh-client openssh-server dnsutils mtr-tiny tcpdump netcat-openbsd
+fx_transition || true
+
+run_block "TOP50: nmap" apt_install nmap
+fx_transition || true
+
+run_block "TOP50: wireshark" bash -lc '
+  echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections || true
+  sudo apt-get install -y wireshark
+' || true
+fx_transition || true
+
+run_block "TOP50: host controls" bash -lc '
+  sudo apt-get install -y --no-install-recommends ufw fail2ban apparmor apparmor-utils
+  sudo systemctl enable --now apparmor >/dev/null 2>&1 || true
+' || true
+fx_transition || true
+
+run_block "TOP50: opensnitch + ui" bash -lc '
+  sudo apt-get install -y opensnitch python3-opensnitch-ui || sudo apt-get install -y opensnitch python3-opensnitch-ui
+  sudo systemctl enable --now opensnitchd >/dev/null 2>&1 || true
+' || true
+fx_transition || true
+
+# VS Code repo + install
+run_block "TOP50: vscode repo + install code" bash -lc '
+  sudo install -d -m 0755 /etc/apt/keyrings
+  wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/keyrings/packages.microsoft.gpg >/dev/null
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" | sudo tee /etc/apt/sources.list.d/vscode.list >/dev/null
+  sudo apt-get update -y
+  sudo apt-get install -y code
+' || true
+fx_transition || true
+
+# Opera repo + install
+run_block "TOP50: opera repo + install opera-stable" bash -lc '
+  wget -qO- https://deb.opera.com/archive.key | gpg --dearmor | sudo dd of=/usr/share/keyrings/opera-browser.gpg status=none
+  echo "deb [signed-by=/usr/share/keyrings/opera-browser.gpg] https://deb.opera.com/opera-stable/ stable non-free" | sudo dd of=/etc/apt/sources.list.d/opera-archive.list status=none
+  sudo apt-get update -y
+  sudo apt-get install -y opera-stable
+' || true
+fx_transition || true
+
+# Flatpak + Tor launcher
+run_block "TOP50: flatpak + flathub" bash -lc '
+  sudo apt-get install -y flatpak gnome-software-plugin-flatpak || sudo apt-get install -y flatpak
+  sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+' || true
+
+run_block "TOP50: tor browser launcher (flatpak app)" bash -lc '
+  sudo flatpak install -y flathub org.torproject.torbrowser-launcher
+' || true
+fx_transition || true
+
+run_block "TOP50: media (vlc/ffmpeg/kodi)" bash -lc 'sudo apt-get install -y vlc ffmpeg kodi' || true
+fx_transition || true
+
+run_block "TOP50: iphone (libimobiledevice/usbmuxd/ifuse)" bash -lc '
+  sudo apt-get install -y libimobiledevice-utils usbmuxd ifuse
+  sudo systemctl enable --now usbmuxd >/dev/null 2>&1 || true
+' || true
+fx_transition || true
+
+run_block "TOP50: rsync" apt_install rsync
+fx_transition || true
+
+# ---------- Extras (optional) ----------
+run_block "EXTRA: can-utils" apt_install can-utils
+
+run_block "EXTRA: vehicle python libs (python-can + obd) in venv" bash -lc '
+  VENV="$HOME/.local/vehicle-venv"
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" -q install --upgrade pip
+  "$VENV/bin/pip" -q install "python-can" "obd"
+  echo "Vehicle venv created at: $VENV"
+' || true
+fx_transition || true
+
+run_block "EXTRA: proton vpn repo + apps" bash -lc '
+  TMP="/tmp/protonvpn-repo.deb"
+  wget -qO "$TMP" https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.8_all.deb
+  sudo dpkg -i "$TMP" || sudo apt-get -f install -y
+  rm -f "$TMP"
+  sudo apt-get update -y
+  sudo apt-get install -y proton-vpn-gnome-desktop proton-vpn-cli || sudo apt-get install -y proton-vpn-cli || true
+' || true
+fx_transition || true
+
+run_block "TOP50: metasploit (rapid7 msfinstall)" bash -lc '
+  cd /tmp
+  curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfinstall.erb > msfinstall
+  chmod 755 msfinstall
+  sudo ./msfinstall
+' || true
+fx_transition || true
+
+# ---------- Verification report ----------
+run_block "TOP50 verification report" bash -lc '
+  declare -A CHECKS=(
+    [metasploit-framework]="command -v msfconsole"
+    [code]="command -v code"
+    [opera-stable]="command -v opera"
+    [flatpak]="command -v flatpak"
+    [torbrowser-launcher]="flatpak list | grep -qi org.torproject.torbrowser-launcher"
+    [opensnitch]="dpkg -s opensnitch"
+    [python3-opensnitch-ui]="dpkg -s python3-opensnitch-ui"
+    [ufw]="command -v ufw"
+    [fail2ban]="command -v fail2ban-client"
+    [apparmor]="dpkg -s apparmor"
+    [apparmor-utils]="dpkg -s apparmor-utils"
+    [wireshark]="command -v wireshark"
+    [tcpdump]="command -v tcpdump"
+    [nmap]="command -v nmap"
+    [netcat-openbsd]="command -v nc"
+    [openssh-client]="command -v ssh"
+    [openssh-server]="dpkg -s openssh-server"
+    [dnsutils]="command -v dig"
+    [mtr-tiny]="command -v mtr"
+    [btop]="command -v btop"
+    [htop]="command -v htop"
+    [iotop]="command -v iotop"
+    [ncdu]="command -v ncdu"
+    [lsof]="command -v lsof"
+    [strace]="command -v strace"
+    [gdb]="command -v gdb"
+    [tmux]="command -v tmux"
+    [ripgrep]="command -v rg"
+    [fd-find]="command -v fdfind"
+    [jq]="command -v jq"
+    [bat]="command -v batcat || command -v bat"
+    [fzf]="command -v fzf"
+    [tree]="command -v tree"
+    [git]="command -v git"
+    [curl]="command -v curl"
+    [wget]="command -v wget"
+    [build-essential]="dpkg -s build-essential"
+    [python3]="command -v python3"
+    [python3-venv]="dpkg -s python3-venv"
+    [python3-pip]="command -v pip3"
+    [pipx]="command -v pipx"
+    [unzip]="command -v unzip"
+    [p7zip-full]="command -v 7z"
+    [vlc]="command -v vlc"
+    [ffmpeg]="command -v ffmpeg"
+    [kodi]="command -v kodi"
+    [rsync]="command -v rsync"
+    [libimobiledevice-utils]="command -v ideviceinfo"
+    [usbmuxd]="dpkg -s usbmuxd"
+    [ifuse]="command -v ifuse"
+  )
+  total=0; ok=0
+  echo "=== TOP50 CHECK ==="
+  for pkg in "${!CHECKS[@]}"; do
+    total=$((total+1))
+    if bash -lc "${CHECKS[$pkg]}" >/dev/null 2>&1; then
+      ok=$((ok+1))
+      printf "OK   %s\n" "$pkg"
+    else
+      printf "MISS %s\n" "$pkg"
+    fi
+  done
+  echo "=== RESULT: $ok / $total present (Top-50 targets) ==="
+' || true
+
+log "DONE. Log saved to: $LOG_FILE"
+EOF
+
+chmod +x elliot_top50_install.sh && ./elliot_top50_install.sh
