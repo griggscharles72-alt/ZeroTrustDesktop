@@ -2,9 +2,21 @@ cat > elliot_top50_install.sh <<'EOF'
 #!/usr/bin/env bash
 # Elliot Super Advanced Master — Top 50 Install Stack (Ubuntu 24.04+)
 # - Independent install blocks (fail -> continue)
-# - Retry + logging + verification
-# - FX runs ONCE at start (Ghost protocol + Matrix rain), never breaks installs
-# - Idempotent: skips already-installed APT packages
+# - Logging + retries + verification
+# - Narrative “topper” FX (Ghost Protocol invoked Series 5000 + status lines)
+# - FX renders to /dev/tty so it WORKS even with tee logging
+# - Optional: Matrix rain topper (pure python, no cmatrix required)
+#
+# Usage:
+#   chmod +x elliot_top50_install.sh
+#   ./elliot_top50_install.sh
+#
+# Controls:
+#   FX_ENABLED=1|0          (default 1)
+#   FX_MODE=topper|rain     (default topper)  # topper = narrative only; rain = includes 0/1 rain
+#   FX_SECONDS=5            (default 5)        # rain duration if FX_MODE=rain
+#   FX_NAME=ELLIOT          (default ELLIOT)   # injected name in rain
+#   LOG_DIR=~/.local/share/elliot-installer
 
 set -u
 set -o pipefail
@@ -17,6 +29,7 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/install_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+# ---------- helpers ----------
 log(){ printf "\n[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
 
 run_block() {
@@ -35,6 +48,7 @@ trap 'log "INTERRUPTED (Ctrl+C). Exiting."; exit 130' INT
 need_sudo() { sudo -v || return 1; }
 
 retry() {
+  # retry <attempts> <sleep_seconds> -- command...
   local attempts="$1"; shift
   local delay="$1"; shift
   local n=1
@@ -47,40 +61,18 @@ retry() {
   done
 }
 
-apt_update() { retry 3 3 sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get update -y; }
-
-# ----- idempotent APT install helpers -----
-is_installed_deb() { dpkg -s "$1" >/dev/null 2>&1; }
-
-apt_install_missing() {
-  # Usage: apt_install_missing pkg1 pkg2 ...
-  local pkgs=()
-  local p
-  for p in "$@"; do
-    if is_installed_deb "$p"; then
-      log "SKIP (already installed): $p"
-    else
-      pkgs+=("$p")
-    fi
-  done
-  [ "${#pkgs[@]}" -eq 0 ] && return 0
-  retry 2 2 sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
-    apt-get install -y --no-install-recommends "${pkgs[@]}"
+apt_update() {
+  retry 3 3 sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get update -y
 }
 
-apt_install_full_missing() {
-  local pkgs=()
-  local p
-  for p in "$@"; do
-    if is_installed_deb "$p"; then
-      log "SKIP (already installed): $p"
-    else
-      pkgs+=("$p")
-    fi
-  done
-  [ "${#pkgs[@]}" -eq 0 ] && return 0
+apt_install() {
   retry 2 2 sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
-    apt-get install -y "${pkgs[@]}"
+    apt-get install -y --no-install-recommends "$@"
+}
+
+apt_install_full() {
+  retry 2 2 sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+    apt-get install -y "$@"
 }
 
 ensure_universe() {
@@ -88,9 +80,10 @@ ensure_universe() {
   sudo add-apt-repository -y universe >/dev/null 2>&1 || true
 }
 
-# ---------- FX MODULE (prints to /dev/tty so it works with tee logging) ----------
+# ---------- FX (renders to /dev/tty, not stdout) ----------
 FX_ENABLED="${FX_ENABLED:-1}"
-FX_SECONDS="${FX_SECONDS:-4}"
+FX_MODE="${FX_MODE:-topper}"     # topper | rain
+FX_SECONDS="${FX_SECONDS:-5}"
 FX_NAME="${FX_NAME:-ELLIOT}"
 FX_TTY="/dev/tty"
 
@@ -99,94 +92,160 @@ fx_ok() {
   [ -w "$FX_TTY" ] || return 1
   return 0
 }
-fx_write(){ printf "%b" "$*" >"$FX_TTY"; }
-fx_line(){ printf "%b\n" "$*" >"$FX_TTY"; }
-fx_clear(){ fx_write "\033[2J\033[H"; }
-fx_hide_cursor(){ fx_write "\033[?25l"; }
-fx_show_cursor(){ fx_write "\033[?25h"; }
-fx_green(){ fx_line "\033[32m$*\033[0m"; }
-fx_dim(){ fx_line "\033[2m$*\033[0m"; }
 
-ghost_protocol_invoked() {
+fx_w(){ printf "%b" "$*" >"$FX_TTY"; }
+fx_l(){ printf "%b\n" "$*" >"$FX_TTY"; }
+fx_clear(){ fx_w "\033[2J\033[H"; }
+fx_hide_cursor(){ fx_w "\033[?25l"; }
+fx_show_cursor(){ fx_w "\033[?25h"; }
+fx_green(){ fx_l "\033[32m$*\033[0m"; }
+fx_white(){ fx_l "\033[97m$*\033[0m"; }
+fx_dim(){ fx_l "\033[2m$*\033[0m"; }
+
+fx_hr() {
+  fx_ok || return 0
+  local cols
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  fx_dim "$(printf '%*s' "$cols" '' | tr ' ' '-')"
+}
+
+fx_spinner() {
+  # fx_spinner <seconds> <message>
+  fx_ok || return 0
+  local seconds="$1"; shift
+  local msg="$*"
+  local end=$(( $(date +%s) + seconds ))
+  local i=0
+  local frames='|/-\'
+  while [ "$(date +%s)" -lt "$end" ]; do
+    local ch="${frames:i%4:1}"
+    fx_w "\r\033[32m[$ch]\033[0m $msg"
+    i=$((i+1))
+    sleep 0.08
+  done
+  fx_w "\r\033[32m[✓]\033[0m $msg\n"
+}
+
+fx_topper() {
   fx_ok || return 0
   fx_clear
   fx_hide_cursor
-  fx_green "Ghost protocol invoked."
-  sleep 2
+  fx_green "Ghost Protocol invoked Series 5000"
+  fx_white "Elliott's private stack downloading now"
+  fx_hr
+  fx_spinner 2 "Acquiring sudo token..."
+  fx_spinner 2 "Link-check: apt mirrors / keyrings / transport..."
+  fx_spinner 2 "Integrity sweep: repo list + keyring state..."
+  fx_spinner 2 "Baseline probe: cpu/mem/disk/net snapshot..."
+  fx_hr
+  fx_white "Handoff: package runner engaged."
+  sleep 0.6
+  fx_show_cursor
 }
 
 matrix_rain_py() {
   fx_ok || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  # Pure terminal “rain” (fast density) — writes directly to /dev/tty
   python3 - <<PY >"$FX_TTY" 2>/dev/null || true
-import sys,time,random,shutil
+import sys,time,random,shutil,os
+
 name="${FX_NAME}"
 secs=float("${FX_SECONDS}")
+
 w,h = shutil.get_terminal_size((80,24))
 green="\033[32m"; reset="\033[0m"; clear="\033[2J\033[H"
-sys.stdout.write(clear)
+hide="\033[?25l"; show="\033[?25h"
+
+sys.stdout.write(clear+hide)
+sys.stdout.flush()
+
 end=time.time()+secs
+cols=[random.randint(1,h) for _ in range(w)]
 while time.time()<end:
-    inject = random.random()<0.45 and w>=len(name)+2
-    start = random.randint(0, max(0,w-len(name)-1)) if inject else 0
-    line=[" "] * w
-    for i in range(w):
-        # denser rain: fewer spaces
-        if random.random()<0.02:
-            line[i]=" "
-        else:
-            line[i]="1" if random.random()>0.5 else "0"
-    if inject:
-        for j,ch in enumerate(name):
-            line[start+j]=ch
-    sys.stdout.write(green + "".join(line) + reset + "\n")
+    # draw multiple drops per frame for density
+    drops_per_frame = max(80, w)
+    for _ in range(drops_per_frame):
+        x = random.randrange(w) + 1
+        y = cols[x-1]
+        ch = random.choice("01")
+        if random.random() < 0.02:
+            ch = " "
+        sys.stdout.write(f"\033[{y};{x}H{green}{ch}{reset}")
+        cols[x-1] += 1
+        if cols[x-1] > h:
+            cols[x-1] = 1
+
+    # occasional name injection
+    if random.random() < 0.18 and w >= len(name) + 2:
+        sx = random.randint(1, w - len(name) - 1)
+        sy = random.randint(2, max(2,h-2))
+        sys.stdout.write(f"\033[{sy};{sx}H{green}{name}{reset}")
+
     sys.stdout.flush()
     time.sleep(0.015)
+
+sys.stdout.write(show+"\n")
+sys.stdout.flush()
 PY
 }
 
-matrix_rain() {
+fx_rain_topper() {
   fx_ok || return 0
-  if command -v cmatrix >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-    timeout "${FX_SECONDS}" cmatrix -b -u 1 -C green >"$FX_TTY" 2>/dev/null || true
-    return 0
-  fi
+  fx_clear
+  fx_hide_cursor
+  fx_green "Ghost Protocol invoked Series 5000"
+  fx_white "Elliott's private stack downloading now"
+  sleep 1.0
   matrix_rain_py
+  fx_show_cursor
 }
 
-fx_intro_once() {
-  ghost_protocol_invoked || true
-  matrix_rain || true
-  fx_show_cursor || true
+fx_outro() {
+  fx_ok || return 0
+  fx_clear
+  fx_hide_cursor
+  fx_green "Ghost Protocol complete."
+  fx_white "Stack ready. Verification report follows."
+  sleep 1.2
+  fx_show_cursor
+}
+
+fx_run_intro() {
+  fx_ok || return 0
+  case "$FX_MODE" in
+    topper) fx_topper ;;
+    rain)   fx_rain_topper ;;
+    *)      fx_topper ;;
+  esac
 }
 
 # ---------- START ----------
 log "Log file: $LOG_FILE"
+
 run_block "sudo auth" need_sudo
 run_block "apt update" apt_update
 
-# Foundation
-run_block "foundation: certs/keys/download/build" apt_install_missing \
+# Foundation (provides add-apt-repository tooling)
+run_block "foundation: certs/keys/download/build" apt_install \
   coreutils ca-certificates gnupg software-properties-common curl wget build-essential unzip p7zip-full
 
 run_block "enable universe" ensure_universe
 run_block "apt update (post-universe)" apt_update
 
-# FX ONCE (after basic deps exist)
-run_block "FX intro (once)" fx_intro_once
-
-# Optional cmatrix (used next runs)
-run_block "visual: install cmatrix (optional)" apt_install_missing cmatrix
+# FX intro (always visible; runs once)
+run_block "FX intro" fx_run_intro
 
 # ---------- TOP-50 installs ----------
-run_block "TOP50: python baseline" apt_install_missing python3 python3-venv python3-pip pipx
-run_block "TOP50: terminal power" apt_install_missing tmux ripgrep fd-find jq bat fzf tree
-run_block "TOP50: monitors + debug" apt_install_missing btop htop iotop ncdu lsof strace gdb
-run_block "TOP50: networking base" apt_install_missing openssh-client openssh-server dnsutils mtr-tiny tcpdump netcat-openbsd
-run_block "TOP50: nmap" apt_install_missing nmap
+run_block "TOP50: python baseline" apt_install python3 python3-venv python3-pip pipx
+run_block "TOP50: terminal power" apt_install tmux ripgrep fd-find jq bat fzf tree
+run_block "TOP50: monitors + debug" apt_install btop htop iotop ncdu lsof strace gdb
+run_block "TOP50: networking base" apt_install openssh-client openssh-server dnsutils mtr-tiny tcpdump netcat-openbsd
+run_block "TOP50: nmap" apt_install nmap
 
 run_block "TOP50: wireshark" bash -lc '
   echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections || true
-  dpkg -s wireshark >/dev/null 2>&1 && exit 0
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y wireshark
 ' || true
 
@@ -196,13 +255,12 @@ run_block "TOP50: host controls" bash -lc '
 ' || true
 
 run_block "TOP50: opensnitch + ui" bash -lc '
-  dpkg -s opensnitch >/dev/null 2>&1 && dpkg -s python3-opensnitch-ui >/dev/null 2>&1 && exit 0
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y opensnitch python3-opensnitch-ui || \
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y opensnitch python3-opensnitch-ui
   sudo systemctl enable --now opensnitchd >/dev/null 2>&1 || true
 ' || true
 
-# VS Code repo + install (idempotent)
+# VS Code repo + install
 run_block "TOP50: vscode repo + install code" bash -lc '
   command -v code >/dev/null 2>&1 && exit 0
   sudo install -d -m 0755 /etc/apt/keyrings
@@ -212,7 +270,7 @@ run_block "TOP50: vscode repo + install code" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y code
 ' || true
 
-# Opera repo + install (idempotent)
+# Opera repo + install (may still prompt on some systems; noninteractive env reduces it)
 run_block "TOP50: opera repo + install opera-stable" bash -lc '
   command -v opera >/dev/null 2>&1 && exit 0
   wget -qO- https://deb.opera.com/archive.key | gpg --dearmor | sudo dd of=/usr/share/keyrings/opera-browser.gpg status=none
@@ -221,9 +279,10 @@ run_block "TOP50: opera repo + install opera-stable" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y opera-stable
 ' || true
 
-# Flatpak + Tor launcher (idempotent)
+# Flatpak + Tor launcher
 run_block "TOP50: flatpak + flathub" bash -lc '
-  dpkg -s flatpak >/dev/null 2>&1 || sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y flatpak
+  sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y flatpak gnome-software-plugin-flatpak || \
+  sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y flatpak
   sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 ' || true
 
@@ -232,29 +291,29 @@ run_block "TOP50: tor browser launcher (flatpak app)" bash -lc '
   sudo flatpak install -y flathub org.torproject.torbrowser-launcher
 ' || true
 
-run_block "TOP50: media (vlc/ffmpeg/kodi)" apt_install_full_missing vlc ffmpeg kodi
+run_block "TOP50: media (vlc/ffmpeg/kodi)" bash -lc '
+  sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y vlc ffmpeg kodi
+' || true
 
 run_block "TOP50: iphone (libimobiledevice/usbmuxd/ifuse)" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y libimobiledevice-utils usbmuxd ifuse
   sudo systemctl enable --now usbmuxd >/dev/null 2>&1 || true
 ' || true
 
-run_block "TOP50: rsync" apt_install_missing rsync
+run_block "TOP50: rsync" apt_install rsync
 
-# ---------- Extras ----------
-run_block "EXTRA: can-utils" apt_install_missing can-utils
+# ---------- Extras (optional) ----------
+run_block "EXTRA: can-utils" apt_install can-utils
 
 run_block "EXTRA: vehicle python libs (python-can + obd) in venv" bash -lc '
   VENV="$HOME/.local/vehicle-venv"
-  [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+  python3 -m venv "$VENV"
   "$VENV/bin/pip" -q install --upgrade pip
   "$VENV/bin/pip" -q install "python-can" "obd"
   echo "Vehicle venv created at: $VENV"
 ' || true
 
 run_block "EXTRA: proton vpn repo + apps" bash -lc '
-  # skip if proton cli already present
-  command -v protonvpn >/dev/null 2>&1 && exit 0
   TMP="/tmp/protonvpn-repo.deb"
   wget -qO "$TMP" https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.8_all.deb
   sudo dpkg -i "$TMP" || sudo apt-get -f install -y
@@ -326,6 +385,7 @@ run_block "TOP50 verification report" bash -lc '
     [usbmuxd]="dpkg -s usbmuxd"
     [ifuse]="command -v ifuse"
   )
+
   total=0; ok=0
   echo "=== TOP50 CHECK ==="
   for pkg in "${!CHECKS[@]}"; do
@@ -339,6 +399,8 @@ run_block "TOP50 verification report" bash -lc '
   done
   echo "=== RESULT: $ok / $total present (Top-50 targets) ==="
 ' || true
+
+run_block "FX outro" fx_outro
 
 log "DONE. Log saved to: $LOG_FILE"
 EOF
