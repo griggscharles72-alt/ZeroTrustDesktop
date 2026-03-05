@@ -1,21 +1,14 @@
 cat > elliot_top50_install.sh <<'EOF'
 #!/usr/bin/env bash
-# Elliot Super Advanced Master — Top 50 Install Stack (Ubuntu 24.04+)
+# Elliot — Top 50 Install Stack (Ubuntu 24.04+)
 # - Independent install blocks (fail -> continue)
 # - Logging + retries + verification
-# - Narrative “topper” FX (Ghost Protocol invoked Series 5000 + status lines)
-# - FX renders to /dev/tty so it WORKS even with tee logging
-# - Optional: Matrix rain topper (pure python, no cmatrix required)
 #
 # Usage:
 #   chmod +x elliot_top50_install.sh
 #   ./elliot_top50_install.sh
 #
 # Controls:
-#   FX_ENABLED=1|0          (default 1)
-#   FX_MODE=topper|rain     (default topper)  # topper = narrative only; rain = includes 0/1 rain
-#   FX_SECONDS=5            (default 5)        # rain duration if FX_MODE=rain
-#   FX_NAME=ELLIOT          (default ELLIOT)   # injected name in rain
 #   LOG_DIR=~/.local/share/elliot-installer
 
 set -u
@@ -80,147 +73,6 @@ ensure_universe() {
   sudo add-apt-repository -y universe >/dev/null 2>&1 || true
 }
 
-# ---------- FX (renders to /dev/tty, not stdout) ----------
-FX_ENABLED="${FX_ENABLED:-1}"
-FX_MODE="${FX_MODE:-topper}"     # topper | rain
-FX_SECONDS="${FX_SECONDS:-5}"
-FX_NAME="${FX_NAME:-ELLIOT}"
-FX_TTY="/dev/tty"
-
-fx_ok() {
-  [ "${FX_ENABLED}" = "1" ] || return 1
-  [ -w "$FX_TTY" ] || return 1
-  return 0
-}
-
-fx_w(){ printf "%b" "$*" >"$FX_TTY"; }
-fx_l(){ printf "%b\n" "$*" >"$FX_TTY"; }
-fx_clear(){ fx_w "\033[2J\033[H"; }
-fx_hide_cursor(){ fx_w "\033[?25l"; }
-fx_show_cursor(){ fx_w "\033[?25h"; }
-fx_green(){ fx_l "\033[32m$*\033[0m"; }
-fx_white(){ fx_l "\033[97m$*\033[0m"; }
-fx_dim(){ fx_l "\033[2m$*\033[0m"; }
-
-fx_hr() {
-  fx_ok || return 0
-  local cols
-  cols="$(tput cols 2>/dev/null || echo 80)"
-  fx_dim "$(printf '%*s' "$cols" '' | tr ' ' '-')"
-}
-
-fx_spinner() {
-  # fx_spinner <seconds> <message>
-  fx_ok || return 0
-  local seconds="$1"; shift
-  local msg="$*"
-  local end=$(( $(date +%s) + seconds ))
-  local i=0
-  local frames='|/-\'
-  while [ "$(date +%s)" -lt "$end" ]; do
-    local ch="${frames:i%4:1}"
-    fx_w "\r\033[32m[$ch]\033[0m $msg"
-    i=$((i+1))
-    sleep 0.08
-  done
-  fx_w "\r\033[32m[✓]\033[0m $msg\n"
-}
-
-fx_topper() {
-  fx_ok || return 0
-  fx_clear
-  fx_hide_cursor
-  fx_green "Ghost Protocol invoked Series 5000"
-  fx_white "Elliott's private stack downloading now"
-  fx_hr
-  fx_spinner 2 "Acquiring sudo token..."
-  fx_spinner 2 "Link-check: apt mirrors / keyrings / transport..."
-  fx_spinner 2 "Integrity sweep: repo list + keyring state..."
-  fx_spinner 2 "Baseline probe: cpu/mem/disk/net snapshot..."
-  fx_hr
-  fx_white "Handoff: package runner engaged."
-  sleep 0.6
-  fx_show_cursor
-}
-
-matrix_rain_py() {
-  fx_ok || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-
-  # Pure terminal “rain” (fast density) — writes directly to /dev/tty
-  python3 - <<PY >"$FX_TTY" 2>/dev/null || true
-import sys,time,random,shutil,os
-
-name="${FX_NAME}"
-secs=float("${FX_SECONDS}")
-
-w,h = shutil.get_terminal_size((80,24))
-green="\033[32m"; reset="\033[0m"; clear="\033[2J\033[H"
-hide="\033[?25l"; show="\033[?25h"
-
-sys.stdout.write(clear+hide)
-sys.stdout.flush()
-
-end=time.time()+secs
-cols=[random.randint(1,h) for _ in range(w)]
-while time.time()<end:
-    # draw multiple drops per frame for density
-    drops_per_frame = max(80, w)
-    for _ in range(drops_per_frame):
-        x = random.randrange(w) + 1
-        y = cols[x-1]
-        ch = random.choice("01")
-        if random.random() < 0.02:
-            ch = " "
-        sys.stdout.write(f"\033[{y};{x}H{green}{ch}{reset}")
-        cols[x-1] += 1
-        if cols[x-1] > h:
-            cols[x-1] = 1
-
-    # occasional name injection
-    if random.random() < 0.18 and w >= len(name) + 2:
-        sx = random.randint(1, w - len(name) - 1)
-        sy = random.randint(2, max(2,h-2))
-        sys.stdout.write(f"\033[{sy};{sx}H{green}{name}{reset}")
-
-    sys.stdout.flush()
-    time.sleep(0.015)
-
-sys.stdout.write(show+"\n")
-sys.stdout.flush()
-PY
-}
-
-fx_rain_topper() {
-  fx_ok || return 0
-  fx_clear
-  fx_hide_cursor
-  fx_green "Ghost Protocol invoked Series 5000"
-  fx_white "Elliott's private stack downloading now"
-  sleep 1.0
-  matrix_rain_py
-  fx_show_cursor
-}
-
-fx_outro() {
-  fx_ok || return 0
-  fx_clear
-  fx_hide_cursor
-  fx_green "Ghost Protocol complete."
-  fx_white "Stack ready. Verification report follows."
-  sleep 1.2
-  fx_show_cursor
-}
-
-fx_run_intro() {
-  fx_ok || return 0
-  case "$FX_MODE" in
-    topper) fx_topper ;;
-    rain)   fx_rain_topper ;;
-    *)      fx_topper ;;
-  esac
-}
-
 # ---------- START ----------
 log "Log file: $LOG_FILE"
 
@@ -233,9 +85,6 @@ run_block "foundation: certs/keys/download/build" apt_install \
 
 run_block "enable universe" ensure_universe
 run_block "apt update (post-universe)" apt_update
-
-# FX intro (always visible; runs once)
-run_block "FX intro" fx_run_intro
 
 # ---------- TOP-50 installs ----------
 run_block "TOP50: python baseline" apt_install python3 python3-venv python3-pip pipx
@@ -270,7 +119,7 @@ run_block "TOP50: vscode repo + install code" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y code
 ' || true
 
-# Opera repo + install (may still prompt on some systems; noninteractive env reduces it)
+# Opera repo + install
 run_block "TOP50: opera repo + install opera-stable" bash -lc '
   command -v opera >/dev/null 2>&1 && exit 0
   wget -qO- https://deb.opera.com/archive.key | gpg --dearmor | sudo dd of=/usr/share/keyrings/opera-browser.gpg status=none
@@ -399,8 +248,6 @@ run_block "TOP50 verification report" bash -lc '
   done
   echo "=== RESULT: $ok / $total present (Top-50 targets) ==="
 ' || true
-
-run_block "FX outro" fx_outro
 
 log "DONE. Log saved to: $LOG_FILE"
 EOF
