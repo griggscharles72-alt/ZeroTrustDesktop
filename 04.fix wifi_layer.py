@@ -1,7 +1,68 @@
+Good base. Structure is clean, idempotent intent is correct, and the stage split is solid.
+
+The main things I would fix before calling this a stable repo step:
+
+### Problems in the current file
+
+1. **`--json` mode is broken**
+   `emit()` writes JSON events, but `status_report()` still prints plain text blocks directly to stdout.
+   Result: mixed machine + human output.
+
+2. **Duplicate `[connection]` section**
+   In `write_nm_defaults()`, you write `[connection]` once for MAC policy and again for `wifi.powersave`. Repeating the same INI section is sloppy and can create parsing ambiguity.
+
+3. **`sudo()` always assumes sudo**
+   If the script is already running as root, it should execute commands directly.
+   If `sudo` is missing and user is non-root, fail early with a clean error.
+
+4. **Temporary file cleanup**
+   `/tmp/...` file is left behind after install. Minor, but unnecessary noise.
+
+5. **Repair path ordering**
+   If `restart_nm` and `toggle_networking` are both used, the current sequence can be redundant. Better to make repair flow deterministic.
+
+6. **No explicit root/sudo validation**
+   You validate Debian-like platform, but not privilege path.
+
+7. **Status collection is display-oriented, not data-oriented**
+   For a reporting layer, it is better to capture sections as strings/dicts and then either print human-readable text or emit structured JSON.
+
+---
+
+## The biggest correctness fix
+
+This part is the real bug:
+
+```python
+lines.append("[connection]")
+lines.append(f"wifi.cloned-mac-address={mac}")
+lines.append("")
+if s.disable_wifi_powersave:
+    lines.append("[connection]")
+    lines.append("wifi.powersave=2")
+```
+
+Make it one section:
+
+```python
+lines.append("[connection]")
+lines.append(f"wifi.cloned-mac-address={mac}")
+if s.disable_wifi_powersave:
+    lines.append("wifi.powersave=2")
+lines.append("")
+```
+
+---
+
+## Hardened version
+
+Below is the corrected version with the fixes folded in.
+
+```python
 #!/usr/bin/env python3
 """
 ZTD — 04. WIFI LAYER (SAFE / IDEMPOTENT / REPAIRABLE)
-Version: 0.2.0
+Version: 0.2.1
 Suite: Zero Trust Desktop
 Stage: 04 (Wi-Fi / Network Stability + Privacy + Reporting)
 
@@ -18,7 +79,7 @@ OPTIONAL BEHAVIOR CHANGES (FLAGS)
   --toggle-networking     nmcli networking off/on (repair)
   --rfkill-unblock        rfkill unblock wifi
   --restart-wpa           restart wpa_supplicant (repair)
-  --set-regdom US         set Wi-Fi reg domain via iw reg set (must be correct country)
+  --set-regdom US         set Wi-Fi reg set (must be correct country)
   --capture-logs          print tail of NetworkManager logs for troubleshooting
   --install-optional      install optional tools (nmap)
 
@@ -31,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -38,14 +100,14 @@ import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Dict, Any
 
 
 APP_NAME = "Zero Trust Desktop"
 APP_ID = "ztd"
 STAGE_NAME = "04. WIFI LAYER"
 STAGE_ID = "ztd_04_wifi_layer"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 HOME = Path.home()
 STATE_DIR = HOME / ".local" / "state" / "zero-trust-desktop" / "ztd_04"
@@ -70,8 +132,8 @@ class Settings:
     install_optional: bool
 
     apply_nm_defaults: bool
-    mac_policy: str              # stable|random
-    disable_wifi_powersave: bool # generally improves stability
+    mac_policy: str
+    disable_wifi_powersave: bool
     force_resolved_dns: bool
 
     restart_nm: bool
@@ -102,15 +164,22 @@ def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def is_root() -> bool:
+    return os.geteuid() == 0
+
+
 def emit(s: Settings, ev: Event) -> None:
+    line = json.dumps(asdict(ev), ensure_ascii=False)
     if s.json_stdout:
-        print(json.dumps(asdict(ev), ensure_ascii=False))
+        print(line)
     else:
         print(f"[{ev.ts}] {ev.level}: {ev.msg}")
+        if ev.data:
+            print(json.dumps(ev.data, indent=2, ensure_ascii=False))
 
     s.log_file.parent.mkdir(parents=True, exist_ok=True)
     with s.log_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(ev), ensure_ascii=False) + "\n")
+        f.write(line + "\n")
 
 
 def info(s: Settings, msg: str, data: Optional[dict] = None) -> None:
@@ -129,12 +198,21 @@ def run(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]
     info(s, "$ " + " ".join(cmd))
     p = subprocess.run(cmd, text=True, capture_output=True)
     if check and p.returncode != 0:
-        error(s, "Command failed", {"rc": p.returncode, "cmd": cmd, "stderr": (p.stderr or "").strip()})
+        error(
+            s,
+            "Command failed",
+            {"rc": p.returncode, "cmd": cmd, "stderr": (p.stderr or "").strip()},
+        )
         raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
     return p.returncode, p.stdout, p.stderr
 
 
 def sudo(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
+    if is_root():
+        return run(s, cmd, check=check)
+    if not have("sudo"):
+        error(s, "sudo is required when not running as root")
+        raise SystemExit(2)
     return run(s, ["sudo"] + cmd, check=check)
 
 
@@ -145,15 +223,16 @@ def require_debian_like(s: Settings) -> None:
 
 
 def dpkg_installed(pkg: str) -> bool:
-    p = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.run(
+        ["dpkg", "-s", pkg],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     return p.returncode == 0
 
 
 def apt_update(s: Settings) -> None:
-    args = ["apt-get", "update"]
-    if s.yes:
-        args.append("-y")
-    sudo(s, args)
+    sudo(s, ["apt-get", "update"])
 
 
 def apt_upgrade(s: Settings) -> None:
@@ -166,10 +245,13 @@ def apt_upgrade(s: Settings) -> None:
 def apt_install_missing(s: Settings, pkgs: Iterable[str]) -> None:
     pkgs = list(pkgs)
     missing = [p for p in pkgs if not dpkg_installed(p)]
+
     for p in pkgs:
         info(s, f"Already installed: {p}" if p not in missing else f"Installing missing package: {p}")
+
     if not missing:
         return
+
     args = ["apt-get", "install"]
     if s.yes:
         args.append("-y")
@@ -187,60 +269,58 @@ def write_nm_defaults(s: Settings) -> None:
 
     mac = s.mac_policy.lower().strip()
     if mac not in ("stable", "random"):
-        raise SystemExit("mac_policy must be stable or random")
+        error(s, "Invalid mac_policy", {"value": mac})
+        raise SystemExit(2)
 
-    lines: List[str] = []
-    lines.append("# Managed by ZTD (Wi-Fi Layer)")
-    lines.append("[device]")
-    lines.append("wifi.scan-rand-mac-address=yes")
-    lines.append("")
-    lines.append("[connection]")
-    lines.append(f"wifi.cloned-mac-address={mac}")
-    lines.append("")
+    lines: List[str] = [
+        "# Managed by ZTD (Wi-Fi Layer)",
+        "[device]",
+        "wifi.scan-rand-mac-address=yes",
+        "",
+        "[connection]",
+        f"wifi.cloned-mac-address={mac}",
+    ]
+
     if s.disable_wifi_powersave:
-        # 2 = disable powersave. Often prevents drops/latency spikes.
-        lines.append("[connection]")
         lines.append("wifi.powersave=2")
-        lines.append("")
+
+    lines.append("")
+
     if s.force_resolved_dns:
-        lines.append("[main]")
-        lines.append("dns=systemd-resolved")
-        lines.append("rc-manager=symlink")
-        lines.append("")
+        lines.extend([
+            "[main]",
+            "dns=systemd-resolved",
+            "rc-manager=symlink",
+            "",
+        ])
 
     content = "\n".join(lines).rstrip() + "\n"
-    info(s, f"Writing NetworkManager defaults: {NM_ZTD_CONF}", {
-        "mac_policy": mac,
-        "disable_wifi_powersave": s.disable_wifi_powersave,
-        "force_resolved_dns": s.force_resolved_dns,
-    })
+
+    info(
+        s,
+        f"Writing NetworkManager defaults: {NM_ZTD_CONF}",
+        {
+            "mac_policy": mac,
+            "disable_wifi_powersave": s.disable_wifi_powersave,
+            "force_resolved_dns": s.force_resolved_dns,
+        },
+    )
 
     tmp = Path("/tmp") / f"{NM_ZTD_CONF.name}.{RUN_ID}"
-    tmp.write_text(content, encoding="utf-8")
-    sudo(s, ["install", "-m", "0644", str(tmp), str(NM_ZTD_CONF)], check=True)
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        sudo(s, ["install", "-m", "0644", str(tmp), str(NM_ZTD_CONF)], check=True)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def do_repairs(s: Settings) -> None:
     if s.rfkill_unblock and have("rfkill"):
         info(s, "rfkill unblock wifi")
         sudo(s, ["rfkill", "unblock", "wifi"], check=False)
-
-    if s.flush_dns and have("resolvectl"):
-        info(s, "Flushing DNS cache (resolvectl flush-caches)")
-        sudo(s, ["resolvectl", "flush-caches"], check=False)
-
-    if s.restart_wpa:
-        info(s, "Restarting wpa_supplicant (best-effort)")
-        sudo(s, ["systemctl", "restart", "wpa_supplicant"], check=False)
-
-    if s.restart_nm:
-        info(s, "Restarting NetworkManager (may drop connection briefly)")
-        sudo(s, ["systemctl", "restart", "NetworkManager"], check=False)
-
-    if s.toggle_networking and have("nmcli"):
-        info(s, "Toggling networking OFF/ON (last-resort repair)")
-        sudo(s, ["nmcli", "networking", "off"], check=False)
-        sudo(s, ["nmcli", "networking", "on"], check=False)
 
     if s.set_regdom:
         cc = s.set_regdom.strip().upper()
@@ -250,14 +330,31 @@ def do_repairs(s: Settings) -> None:
         else:
             warn(s, "iw not found; cannot set reg domain")
 
+    if s.flush_dns and have("resolvectl"):
+        info(s, "Flushing DNS cache (resolvectl flush-caches)")
+        sudo(s, ["resolvectl", "flush-caches"], check=False)
+
+    if s.restart_wpa:
+        info(s, "Restarting wpa_supplicant (best-effort)")
+        sudo(s, ["systemctl", "restart", "wpa_supplicant"], check=False)
+
+    if s.toggle_networking and have("nmcli"):
+        info(s, "Toggling networking OFF/ON (last-resort repair)")
+        sudo(s, ["nmcli", "networking", "off"], check=False)
+        sudo(s, ["nmcli", "networking", "on"], check=False)
+
+    if s.restart_nm:
+        info(s, "Restarting NetworkManager (may drop connection briefly)")
+        sudo(s, ["systemctl", "restart", "NetworkManager"], check=False)
+
 
 def _cap(cmd: List[str]) -> str:
     p = subprocess.run(cmd, text=True, capture_output=True)
     return (p.stdout or p.stderr or "").strip()
 
 
-def status_report(s: Settings) -> None:
-    info(s, "Status report", {
+def gather_status(s: Settings) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
         "app": APP_ID,
         "stage": STAGE_ID,
         "version": VERSION,
@@ -266,66 +363,79 @@ def status_report(s: Settings) -> None:
         "python": sys.version.splitlines()[0],
         "nm_conf": str(NM_ZTD_CONF) if NM_ZTD_CONF.exists() else "not-present",
         "log": str(s.log_file),
-    })
+    }
 
-    if have("nmcli"):
-        print("\n--- nmcli general ---")
-        print(_cap(["nmcli", "general", "status"]))
-        print("\n--- nmcli radio ---")
-        print(_cap(["nmcli", "radio"]))
-        print("\n--- nmcli device ---")
-        print(_cap(["nmcli", "device", "status"]))
-        print("\n--- active connections ---")
-        print(_cap(["nmcli", "connection", "show", "--active"]))
-        print("\n--- wifi list (top 20) ---")
-        print(_cap(["bash", "-lc", "nmcli -f IN-USE,SSID,SECURITY,SIGNAL,RATE,BARS device wifi list | head -n 21"]))
-    else:
-        warn(s, "nmcli not found")
+    report["nmcli_general"] = _cap(["nmcli", "general", "status"]) if have("nmcli") else None
+    report["nmcli_radio"] = _cap(["nmcli", "radio"]) if have("nmcli") else None
+    report["nmcli_device"] = _cap(["nmcli", "device", "status"]) if have("nmcli") else None
+    report["nmcli_active"] = _cap(["nmcli", "connection", "show", "--active"]) if have("nmcli") else None
+    report["wifi_list_top20"] = (
+        _cap(["bash", "-lc", "nmcli -f IN-USE,SSID,SECURITY,SIGNAL,RATE,BARS device wifi list | head -n 21"])
+        if have("nmcli") else None
+    )
 
-    if have("ip"):
-        print("\n--- ip addr (brief) ---")
-        print(_cap(["bash", "-lc", "ip -br addr"]))
-        print("\n--- ip route ---")
-        print(_cap(["ip", "route"]))
-    else:
-        warn(s, "ip not found")
-
-    if have("iw"):
-        # Driver/firmware hints
-        print("\n--- iw dev ---")
-        print(_cap(["bash", "-lc", "iw dev || true"]))
-    else:
-        warn(s, "iw not found")
+    report["ip_addr_brief"] = _cap(["bash", "-lc", "ip -br addr"]) if have("ip") else None
+    report["ip_route"] = _cap(["ip", "route"]) if have("ip") else None
+    report["iw_dev"] = _cap(["bash", "-lc", "iw dev || true"]) if have("iw") else None
 
     if have("resolvectl"):
-        print("\n--- resolvectl status (head) ---")
-        print(_cap(["bash", "-lc", "resolvectl status | head -n 80"]))
+        report["dns_status"] = _cap(["bash", "-lc", "resolvectl status | head -n 80"])
     else:
-        print("\n--- /etc/resolv.conf (head) ---")
-        print(_cap(["bash", "-lc", "cat /etc/resolv.conf 2>/dev/null | head -n 40 || true"]))
+        report["dns_status"] = _cap(["bash", "-lc", "cat /etc/resolv.conf 2>/dev/null | head -n 40 || true"])
 
     vpn_if = _cap(["bash", "-lc", "ip -o link show | awk -F': ' '{print $2}' | egrep '^(tun|wg|proton)' || true"])
     default_route = _cap(["bash", "-lc", "ip route show default || true"])
-    info(s, "VPN heuristic", {
+    report["vpn_heuristic"] = {
         "vpn_like_interfaces": vpn_if.splitlines() if vpn_if else [],
         "default_route": default_route,
-    })
+    }
 
     if s.capture_logs and have("journalctl"):
-        print("\n--- NetworkManager logs (tail) ---")
-        print(_cap(["bash", "-lc", "journalctl -u NetworkManager -b --no-pager | tail -n 200 || true"]))
+        report["networkmanager_logs_tail"] = _cap(
+            ["bash", "-lc", "journalctl -u NetworkManager -b --no-pager | tail -n 200 || true"]
+        )
+
+    return report
+
+
+def status_report(s: Settings) -> None:
+    report = gather_status(s)
+    info(s, "Status report", report)
+
+    if s.json_stdout:
+        return
+
+    def section(title: str, value: Optional[str]) -> None:
+        print(f"\n--- {title} ---")
+        print(value if value else "(not available)")
+
+    section("nmcli general", report.get("nmcli_general"))
+    section("nmcli radio", report.get("nmcli_radio"))
+    section("nmcli device", report.get("nmcli_device"))
+    section("active connections", report.get("nmcli_active"))
+    section("wifi list (top 20)", report.get("wifi_list_top20"))
+    section("ip addr (brief)", report.get("ip_addr_brief"))
+    section("ip route", report.get("ip_route"))
+    section("iw dev", report.get("iw_dev"))
+    section("dns status", report.get("dns_status"))
+
+    print("\n--- vpn heuristic ---")
+    print(json.dumps(report.get("vpn_heuristic", {}), indent=2, ensure_ascii=False))
+
+    if s.capture_logs:
+        section("NetworkManager logs (tail)", report.get("networkmanager_logs_tail"))
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="04_wifi_layer.py")
     p.add_argument("--yes", action="store_true", help="Non-interactive apt (-y)")
-    p.add_argument("--json", action="store_true", help="Emit JSON to stdout (log always JSONL)")
+    p.add_argument("--json", action="store_true", help="Emit JSON events to stdout (log always JSONL)")
 
     p.add_argument("--upgrade", action="store_true", help="Run apt-get upgrade (explicit)")
     p.add_argument("--install-optional", action="store_true", help="Install optional tooling (includes nmap)")
 
     p.add_argument("--apply-nm-defaults", action="store_true", help="Write NetworkManager defaults config")
-    p.add_argument("--mac-policy", choices=["stable", "random"], default="stable", help="MAC policy (stable recommended)")
+    p.add_argument("--mac-policy", choices=["stable", "random"], default="stable", help="MAC policy")
     p.add_argument("--no-disable-powersave", action="store_true", help="Do NOT disable Wi-Fi powersave")
     p.add_argument("--no-force-resolved-dns", action="store_true", help="Do NOT force systemd-resolved DNS integration")
 
@@ -335,7 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rfkill-unblock", action="store_true", help="rfkill unblock wifi")
     p.add_argument("--restart-wpa", action="store_true", help="Restart wpa_supplicant")
 
-    p.add_argument("--set-regdom", default=None, help="Set Wi-Fi regulatory domain (e.g., US, NO) - must be correct")
+    p.add_argument("--set-regdom", default=None, help="Set Wi-Fi regulatory domain (e.g. US, MX) - must be correct")
     p.add_argument("--capture-logs", action="store_true", help="Print tail of NetworkManager logs")
 
     return p
@@ -402,3 +512,37 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+```
+
+## Recommended execution patterns
+
+Safe default run:
+
+```bash
+python3 04_wifi_layer.py --yes
+```
+
+Apply sane NM defaults and print logs:
+
+```bash
+python3 04_wifi_layer.py --yes --apply-nm-defaults --capture-logs
+```
+
+Repair sweep:
+
+```bash
+python3 04_wifi_layer.py --yes --rfkill-unblock --flush-dns --restart-wpa --restart-nm
+```
+
+Structured output mode:
+
+```bash
+python3 04_wifi_layer.py --yes --json > wifi_run.jsonl
+```
+
+## My verdict
+
+This is already repo-worthy, but **not yet final** because of the duplicate INI section and broken JSON mode.
+Fix those two and it becomes a clean stage file.
+
+Next upgrade I would do is add a **`--self-test`** mode that runs only capability checks and exits nonzero on missing prerequisites.
