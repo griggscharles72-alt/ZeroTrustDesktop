@@ -1,3 +1,40 @@
+# ---------------------------
+# Ghost Protocol 00 (Topper)
+# ---------------------------
+ghost_protocol() {
+  local countdown="${1:-5}"   # seconds
+  local rows="${2:-10}"       # >=10 recommended
+  local cols="${3:-64}"       # width per line
+
+  local GREEN="\033[0;32m"
+  local RESET="\033[0m"
+
+  # clear screen
+  clear
+
+  printf "${GREEN}Initializing Ghost Protocol… It will begin in %s seconds.${RESET}\n" "$countdown"
+  sleep 0.6
+
+  local i
+  for (( i=countdown; i>=1; i-- )); do
+    printf "${GREEN}%s...${RESET}\n" "$i"
+    sleep 1
+  done
+
+  printf "${GREEN}Initializing Ghost Protocol...${RESET}\n"
+  sleep 0.3
+
+  # print rows of binary strings
+  for (( i=1; i<=rows; i++ )); do
+    line=$(tr -dc '01' < /dev/urandom | head -c "$cols")
+    printf "${GREEN}%s${RESET}\n" "$line"
+  done
+
+  printf "\n"
+}
+
+# call topper
+ghost_protocol 5 10 64
 cat > elliot_top50_install.sh <<'EOF'
 #!/usr/bin/env bash
 # Elliot — Top 50 Install Stack (Ubuntu 24.04+)
@@ -7,7 +44,7 @@ cat > elliot_top50_install.sh <<'EOF'
 # Usage:
 #   chmod +x elliot_top50_install.sh
 #   ./elliot_top50_install.sh
-#
+#c
 # Controls:
 #   LOG_DIR=~/.local/share/elliot-installer
 
