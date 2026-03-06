@@ -1,63 +1,3 @@
-Good base. Structure is clean, idempotent intent is correct, and the stage split is solid.
-
-The main things I would fix before calling this a stable repo step:
-
-### Problems in the current file
-
-1. **`--json` mode is broken**
-   `emit()` writes JSON events, but `status_report()` still prints plain text blocks directly to stdout.
-   Result: mixed machine + human output.
-
-2. **Duplicate `[connection]` section**
-   In `write_nm_defaults()`, you write `[connection]` once for MAC policy and again for `wifi.powersave`. Repeating the same INI section is sloppy and can create parsing ambiguity.
-
-3. **`sudo()` always assumes sudo**
-   If the script is already running as root, it should execute commands directly.
-   If `sudo` is missing and user is non-root, fail early with a clean error.
-
-4. **Temporary file cleanup**
-   `/tmp/...` file is left behind after install. Minor, but unnecessary noise.
-
-5. **Repair path ordering**
-   If `restart_nm` and `toggle_networking` are both used, the current sequence can be redundant. Better to make repair flow deterministic.
-
-6. **No explicit root/sudo validation**
-   You validate Debian-like platform, but not privilege path.
-
-7. **Status collection is display-oriented, not data-oriented**
-   For a reporting layer, it is better to capture sections as strings/dicts and then either print human-readable text or emit structured JSON.
-
----
-
-## The biggest correctness fix
-
-This part is the real bug:
-
-```python
-lines.append("[connection]")
-lines.append(f"wifi.cloned-mac-address={mac}")
-lines.append("")
-if s.disable_wifi_powersave:
-    lines.append("[connection]")
-    lines.append("wifi.powersave=2")
-```
-
-Make it one section:
-
-```python
-lines.append("[connection]")
-lines.append(f"wifi.cloned-mac-address={mac}")
-if s.disable_wifi_powersave:
-    lines.append("wifi.powersave=2")
-lines.append("")
-```
-
----
-
-## Hardened version
-
-Below is the corrected version with the fixes folded in.
-
 ```python
 #!/usr/bin/env python3
 """
@@ -540,9 +480,3 @@ Structured output mode:
 python3 04_wifi_layer.py --yes --json > wifi_run.jsonl
 ```
 
-## My verdict
-
-This is already repo-worthy, but **not yet final** because of the duplicate INI section and broken JSON mode.
-Fix those two and it becomes a clean stage file.
-
-Next upgrade I would do is add a **`--self-test`** mode that runs only capability checks and exits nonzero on missing prerequisites.
