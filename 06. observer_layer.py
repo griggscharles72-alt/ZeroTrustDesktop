@@ -1,74 +1,126 @@
 #!/usr/bin/env python3
 """
-ZTD — 06. OBSERVER LAYER (FULL TOOL ARSENAL + POSTURE REPORT)
-Version: 0.6.0
-Suite: Zero Trust Desktop (ZTD)
-Stage: 06 (Observer / Evidence / Tooling)
+README
+======
 
-GOAL
-  Install a comprehensive security + networking toolkit and emit a deterministic posture report
-  WITHOUT enforcing firewall rules or breaking development.
+Filename:
+    06_observer_layer.py
 
-DEFAULT BEHAVIOR (SAFE)
-  - apt-get update
-  - install missing observer/tooling packages (idempotent; no removals)
-  - write snapshots + report to disk
-  - print a readable summary
+Repo placement:
+    ~/ztd/06_observer_layer.py
 
-OPTIONAL BEHAVIOR (EXPLICIT FLAGS)
-  --upgrade                apt-get upgrade (explicit)
-  --run-lynis              run lynis audit (can take time)
-  --run-rkhunter           run rkhunter check (can take time; may warn a lot)
-  --run-chkrootkit         run chkrootkit (can take time; may warn a lot)
-  --capture-pcap <iface>   capture a short tcpdump sample (requires sudo; opt-in)
-  --nmap-local             run nmap against localhost (opt-in)
-  --lan-sweep <CIDR>       run nmap ping-sweep (opt-in; only if you explicitly give CIDR)
-  --wireshark-group        add current user to wireshark group (logout/login required)
+Purpose:
+    Zero Trust Desktop (ZTD) Stage 06 observer layer.
+    Installs a development-safe observer toolkit and writes a deterministic
+    posture report plus host snapshots to disk without changing firewall policy
+    or blocking traffic.
 
-NOTES
-  - Debian/Ubuntu only.
-  - This layer installs Wireshark but does not capture traffic unless explicitly asked.
-  - No firewall changes. No network blocking. No OpenSnitch enablement.
+System requirements:
+    - Debian/Ubuntu-like Linux
+    - python3
+    - sudo
+    - apt-get
+    - dpkg
 
-OUTPUT
-  - JSONL log: ~/.local/state/zero-trust-desktop/ztd_06/log/ztd_06_<ts>.jsonl
-  - Snapshots: ~/.local/state/zero-trust-desktop/ztd_06/snapshots/<ts>/
+Default behavior:
+    - validate platform and sudo access
+    - apt-get update
+    - install missing observer packages only
+    - capture deterministic host/network/security snapshots
+    - write JSONL log + snapshot files under the operator's home state directory
+    - print a readable run summary
+
+Optional flags:
+    --upgrade
+        Run apt-get upgrade explicitly.
+
+    --run-lynis
+        Run lynis system audit and save output.
+
+    --run-rkhunter
+        Run rkhunter check and save output.
+
+    --capture-pcap IFACE
+        Capture a short tcpdump sample on the given interface.
+
+    --pcap-seconds N
+        Duration for packet capture. Default: 7 seconds.
+
+    --nmap-local
+        Run an nmap localhost service scan.
+
+    --lan-sweep CIDR
+        Run an opt-in nmap ping sweep against a provided CIDR.
+
+    --yes
+        Use non-interactive apt (-y).
+
+    --json
+        Emit JSON events to stdout instead of readable text.
+
+Design notes:
+    - This stage does not install firewall policy stacks by default.
+    - This stage does not modify group membership.
+    - This stage does not install malware scanners.
+    - Snapshot capture is best-effort and records non-zero command results.
+    - Long-running checks use explicit timeouts.
+    - State is written under the real operator account, even if launched with sudo.
+
+Paths:
+    Script path:
+        Resolved using __file__ so the script works from any current directory.
+
+    State path:
+        ~/.local/state/zero-trust-desktop/ztd_06/
+
+    Output:
+        JSONL log:
+            ~/.local/state/zero-trust-desktop/ztd_06/log/ztd_06_observer_layer_<ts>.jsonl
+
+        Snapshots:
+            ~/.local/state/zero-trust-desktop/ztd_06/snapshots/<ts>/
+
+Example runs:
+    python3 ~/ztd/06_observer_layer.py --yes
+    python3 ~/ztd/06_observer_layer.py --yes --run-lynis --run-rkhunter
+    python3 ~/ztd/06_observer_layer.py --yes --nmap-local
+    python3 ~/ztd/06_observer_layer.py --yes --capture-pcap wlan0 --pcap-seconds 10
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import platform
+import pwd
 import shutil
 import subprocess
-import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_DIR = SCRIPT_PATH.parent
+
 APP_NAME = "Zero Trust Desktop"
 APP_ID = "ztd"
 STAGE_NAME = "06. OBSERVER LAYER"
 STAGE_ID = "ztd_06_observer_layer"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
-HOME = Path.home()
-STATE_DIR = HOME / ".local" / "state" / "zero-trust-desktop" / "ztd_06"
-LOG_DIR = STATE_DIR / "log"
-SNAP_DIR = STATE_DIR / "snapshots"
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_FILE = LOG_DIR / f"{STAGE_ID}_{RUN_ID}.jsonl"
-SNAPSHOT_ROOT = SNAP_DIR / RUN_ID
+DEFAULT_TIMEOUT_SHORT = 30
+DEFAULT_TIMEOUT_MEDIUM = 120
+DEFAULT_TIMEOUT_LONG = 900
+DEFAULT_TIMEOUT_RKHUNTER = 1200
 
-# Comprehensive, dev-safe tooling. Some may already be installed from earlier layers.
 PKGS_OBSERVER_CORE = [
     # Discovery / visibility
     "nmap",
     "arp-scan",
-    "netdiscover",
     "fping",
     "traceroute",
     "mtr-tiny",
@@ -79,9 +131,7 @@ PKGS_OBSERVER_CORE = [
     # Performance / link visibility
     "iperf3",
     "ethtool",
-    "wavemon",
     "iw",
-    "wireless-tools",
     "rfkill",
     # Traffic inspection
     "tcpdump",
@@ -93,21 +143,7 @@ PKGS_OBSERVER_CORE = [
     "sysstat",
     # Posture scanners
     "lynis",
-    "debsums",
-    "aide",
     "rkhunter",
-    "chkrootkit",
-    # Optional-ish but useful
-    "ufw",
-    "nftables",
-    "iptables",
-    "conntrack",
-]
-
-# Malware scanner (install-only; scanning opt-in)
-PKGS_MALWARE = [
-    "clamav",
-    "clamav-daemon",
 ]
 
 
@@ -115,24 +151,20 @@ PKGS_MALWARE = [
 class Settings:
     yes: bool
     json_stdout: bool
-
     upgrade: bool
-    install_malware: bool
-
     run_lynis: bool
     run_rkhunter: bool
-    run_chkrootkit: bool
-
     capture_pcap_iface: Optional[str]
     capture_pcap_seconds: int
-
     nmap_local: bool
     lan_sweep_cidr: Optional[str]
-
-    wireshark_group: bool
-
+    state_dir: Path
+    log_dir: Path
+    snapshot_dir: Path
     log_file: Path
-    snapshot_root: Path
+    run_id: str
+    operator_user: str
+    operator_home: Path
 
 
 @dataclass
@@ -151,13 +183,30 @@ def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def detect_operator_user() -> str:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        return sudo_user
+    return getpass.getuser()
+
+
+def detect_operator_home(user: str) -> Path:
+    try:
+        return Path(pwd.getpwnam(user).pw_dir).resolve()
+    except Exception:
+        return Path.home().resolve()
+
+
 def emit(s: Settings, ev: Event) -> None:
     if s.json_stdout:
         print(json.dumps(asdict(ev), ensure_ascii=False))
     else:
-        print(f"[{ev.ts}] {ev.level}: {ev.msg}")
+        if ev.data:
+            print(f"[{ev.ts}] {ev.level}: {ev.msg} :: {json.dumps(ev.data, ensure_ascii=False)}")
+        else:
+            print(f"[{ev.ts}] {ev.level}: {ev.msg}")
 
-    s.log_file.parent.mkdir(parents=True, exist_ok=True)
+    s.log_dir.mkdir(parents=True, exist_ok=True)
     with s.log_file.open("a", encoding="utf-8") as f:
         f.write(json.dumps(asdict(ev), ensure_ascii=False) + "\n")
 
@@ -174,23 +223,70 @@ def error(s: Settings, msg: str, data: Optional[dict] = None) -> None:
     emit(s, Event(ts=now_ts(), level="ERROR", msg=msg, data=data))
 
 
-def run(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
-    info(s, "$ " + " ".join(cmd))
-    p = subprocess.run(cmd, text=True, capture_output=True)
+def run(
+    s: Settings,
+    cmd: List[str],
+    *,
+    check: bool = True,
+    timeout: Optional[int] = None,
+) -> Tuple[int, str, str]:
+    info(s, "$ " + " ".join(cmd), {"timeout_seconds": timeout})
+    try:
+        p = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        error(s, "Command timed out", {"cmd": cmd, "timeout_seconds": timeout})
+        if check:
+            raise RuntimeError(f"Command timed out: {' '.join(cmd)}")
+        return 124, "", f"Timed out after {timeout} seconds"
+
     if check and p.returncode != 0:
-        error(s, "Command failed", {"rc": p.returncode, "cmd": cmd, "stderr": (p.stderr or "").strip()})
+        error(
+            s,
+            "Command failed",
+            {
+                "rc": p.returncode,
+                "cmd": cmd,
+                "stderr": (p.stderr or "").strip(),
+            },
+        )
         raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
-    return p.returncode, p.stdout, p.stderr
+
+    return p.returncode, p.stdout or "", p.stderr or ""
 
 
-def sudo(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
-    return run(s, ["sudo"] + cmd, check=check)
+def sudo(
+    s: Settings,
+    cmd: List[str],
+    *,
+    check: bool = True,
+    timeout: Optional[int] = None,
+) -> Tuple[int, str, str]:
+    return run(s, ["sudo"] + cmd, check=check, timeout=timeout)
 
 
 def require_debian_like(s: Settings) -> None:
-    if not (Path("/etc/os-release").exists() and have("apt-get") and have("dpkg")):
-        error(s, "Unsupported platform. Debian/Ubuntu with apt-get/dpkg required.")
+    os_release = Path("/etc/os-release")
+    if not (os_release.exists() and have("apt-get") and have("dpkg") and have("sudo")):
+        error(s, "Unsupported platform. Debian/Ubuntu with apt-get, dpkg, and sudo required.")
         raise SystemExit(2)
+
+    text = os_release.read_text(encoding="utf-8", errors="ignore").lower()
+    if not any(token in text for token in ("id=ubuntu", "id=debian", "id_like=debian")):
+        error(s, "Unsupported distro family. Debian-like system required.")
+        raise SystemExit(2)
+
+
+def sudo_preflight(s: Settings) -> None:
+    info(s, "Validating sudo access")
+    p = subprocess.run(["sudo", "-v"], text=True, capture_output=True)
+    if p.returncode != 0:
+        error(s, "sudo validation failed", {"rc": p.returncode, "stderr": (p.stderr or "").strip()})
+        raise SystemExit(1)
 
 
 def dpkg_installed(pkg: str) -> bool:
@@ -202,130 +298,149 @@ def apt_update(s: Settings) -> None:
     args = ["apt-get", "update"]
     if s.yes:
         args.append("-y")
-    sudo(s, args)
+    sudo(s, args, timeout=DEFAULT_TIMEOUT_LONG)
 
 
 def apt_upgrade(s: Settings) -> None:
     args = ["apt-get", "upgrade"]
     if s.yes:
         args.append("-y")
-    sudo(s, args)
+    sudo(s, args, timeout=DEFAULT_TIMEOUT_LONG)
 
 
 def apt_install_missing(s: Settings, pkgs: Iterable[str]) -> None:
-    pkgs = list(pkgs)
-    missing = [p for p in pkgs if not dpkg_installed(p)]
-    for p in pkgs:
-        info(s, f"Already installed: {p}" if p not in missing else f"Installing missing package: {p}")
+    pkg_list = list(pkgs)
+    missing = [pkg for pkg in pkg_list if not dpkg_installed(pkg)]
+
+    for pkg in pkg_list:
+        if pkg in missing:
+            info(s, "Installing missing package", {"package": pkg})
+        else:
+            info(s, "Already installed", {"package": pkg})
+
     if not missing:
         return
+
     args = ["apt-get", "install"]
     if s.yes:
         args.append("-y")
-    args += missing
-    sudo(s, args)
+    args.extend(missing)
+    sudo(s, args, timeout=DEFAULT_TIMEOUT_LONG)
 
 
 def write_snapshot_file(s: Settings, name: str, content: str) -> Path:
-    s.snapshot_root.mkdir(parents=True, exist_ok=True)
-    path = s.snapshot_root / name
+    s.snapshot_dir.mkdir(parents=True, exist_ok=True)
+    path = s.snapshot_dir / name
     path.write_text(content, encoding="utf-8", errors="ignore")
     return path
 
 
-def _cap(cmd: List[str]) -> str:
-    p = subprocess.run(cmd, text=True, capture_output=True)
-    return (p.stdout or p.stderr or "").strip()
-
-
-def capture_cmd(s: Settings, name: str, cmd: List[str]) -> None:
+def cap(cmd: List[str], *, timeout: Optional[int] = None) -> Tuple[int, str]:
     try:
-        txt = _cap(cmd)
-        write_snapshot_file(s, name, (txt + "\n").lstrip())
-    except Exception as e:
-        warn(s, f"Snapshot capture failed: {name}", {"error": str(e)})
+        p = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        combined = ((p.stdout or "") + ("\n" + p.stderr if p.stderr else "")).strip()
+        return p.returncode, combined
+    except subprocess.TimeoutExpired:
+        return 124, f"Timed out after {timeout} seconds"
+
+
+def capture_cmd(
+    s: Settings,
+    name: str,
+    cmd: List[str],
+    *,
+    timeout: Optional[int] = DEFAULT_TIMEOUT_SHORT,
+) -> None:
+    try:
+        rc, txt = cap(cmd, timeout=timeout)
+        body = txt.strip()
+        if rc != 0:
+            warn(s, "Snapshot command returned non-zero", {"name": name, "rc": rc, "cmd": cmd})
+            prefix = f"[command_rc={rc}]"
+            body = f"{prefix}\n{body}" if body else prefix
+        write_snapshot_file(s, name, body + ("\n" if body else ""))
+    except Exception as exc:
+        warn(s, "Snapshot capture failed", {"name": name, "error": str(exc)})
 
 
 def baseline_snapshots(s: Settings) -> None:
-    info(s, "Snapshot start", {"snapshot_dir": str(s.snapshot_root)})
+    info(s, "Snapshot start", {"snapshot_dir": str(s.snapshot_dir)})
 
     capture_cmd(s, "uname.txt", ["uname", "-a"])
     if have("lsb_release"):
         capture_cmd(s, "lsb_release.txt", ["lsb_release", "-a"])
     capture_cmd(s, "ip_addr_brief.txt", ["bash", "-lc", "ip -br addr || true"])
     capture_cmd(s, "ip_route.txt", ["bash", "-lc", "ip route || true"])
-    capture_cmd(s, "ss_listen.txt", ["bash", "-lc", "ss -tulnp | sed -n '1,220p' || true"])
+    capture_cmd(s, "ss_listen.txt", ["bash", "-lc", "ss -tulnp | sed -n '1,220p' || true"], timeout=DEFAULT_TIMEOUT_MEDIUM)
     capture_cmd(s, "resolv_conf.txt", ["bash", "-lc", "cat /etc/resolv.conf 2>/dev/null | head -n 80 || true"])
 
     if have("resolvectl"):
-        capture_cmd(s, "resolvectl_status.txt", ["bash", "-lc", "resolvectl status | head -n 200 || true"])
+        capture_cmd(s, "resolvectl_status.txt", ["bash", "-lc", "resolvectl status | head -n 200 || true"], timeout=DEFAULT_TIMEOUT_MEDIUM)
 
     if have("nmcli"):
         capture_cmd(s, "nmcli_general.txt", ["nmcli", "general", "status"])
         capture_cmd(s, "nmcli_device.txt", ["nmcli", "device", "status"])
         capture_cmd(s, "nmcli_active.txt", ["nmcli", "connection", "show", "--active"])
-        capture_cmd(s, "nmcli_wifi_list.txt", ["bash", "-lc", "nmcli -f IN-USE,SSID,SECURITY,SIGNAL,RATE,BARS device wifi list | head -n 40 || true"])
+        capture_cmd(
+            s,
+            "nmcli_wifi_list.txt",
+            ["bash", "-lc", "nmcli -f IN-USE,SSID,SECURITY,SIGNAL,RATE,BARS device wifi list | head -n 40 || true"],
+            timeout=DEFAULT_TIMEOUT_MEDIUM,
+        )
 
-    # Firewall state (visibility only)
     if have("nft"):
-        capture_cmd(s, "nft_ruleset.txt", ["sudo", "nft", "list", "ruleset"])
+        capture_cmd(s, "nft_ruleset.txt", ["sudo", "nft", "list", "ruleset"], timeout=DEFAULT_TIMEOUT_MEDIUM)
     if have("ufw"):
-        capture_cmd(s, "ufw_status_verbose.txt", ["sudo", "ufw", "status", "verbose"])
+        capture_cmd(s, "ufw_status_verbose.txt", ["sudo", "ufw", "status", "verbose"], timeout=DEFAULT_TIMEOUT_MEDIUM)
     if have("iptables-save"):
-        capture_cmd(s, "iptables_save.txt", ["sudo", "iptables-save"])
+        capture_cmd(s, "iptables_save.txt", ["sudo", "iptables-save"], timeout=DEFAULT_TIMEOUT_MEDIUM)
 
-    # AppArmor status
     if have("aa-status"):
-        capture_cmd(s, "apparmor_status_head.txt", ["bash", "-lc", "aa-status | head -n 200 || true"])
+        capture_cmd(s, "apparmor_status_head.txt", ["bash", "-lc", "aa-status | head -n 200 || true"], timeout=DEFAULT_TIMEOUT_MEDIUM)
 
-    # Services snapshot
     if have("systemctl"):
-        capture_cmd(s, "security_services.txt", ["bash", "-lc", "systemctl list-units --type=service --no-pager | egrep 'apparmor|fail2ban|ufw|nftables|NetworkManager' || true"])
-        capture_cmd(s, "failed_units.txt", ["bash", "-lc", "systemctl --failed --no-pager || true"])
+        capture_cmd(
+            s,
+            "security_services.txt",
+            ["bash", "-lc", "systemctl list-units --type=service --no-pager | egrep 'apparmor|fail2ban|ufw|nftables|NetworkManager' || true"],
+            timeout=DEFAULT_TIMEOUT_MEDIUM,
+        )
+        capture_cmd(
+            s,
+            "failed_units.txt",
+            ["bash", "-lc", "systemctl --failed --no-pager || true"],
+            timeout=DEFAULT_TIMEOUT_MEDIUM,
+        )
 
-    info(s, "Snapshot complete", {"snapshot_dir": str(s.snapshot_root)})
+    info(s, "Snapshot complete", {"snapshot_dir": str(s.snapshot_dir)})
 
 
-def maybe_add_wireshark_group(s: Settings) -> None:
-    if not s.wireshark_group:
-        return
-    # On Debian/Ubuntu, group is typically "wireshark"
-    info(s, "Adding current user to wireshark group (logout/login required)")
-    sudo(s, ["usermod", "-aG", "wireshark", str(Path.home().owner())], check=False)  # best-effort
-
-
-def run_lynis(s: Settings) -> None:
+def run_lynis_audit(s: Settings) -> None:
     if not s.run_lynis:
         return
     if not have("lynis"):
         warn(s, "lynis not found")
         return
-    info(s, "Running lynis audit (this can take time)")
-    # Best-effort: capture output
-    txt = _cap(["sudo", "lynis", "audit", "system", "--quick"])
-    write_snapshot_file(s, "lynis_audit.txt", txt + "\n")
+
+    info(s, "Running lynis audit", {"timeout_seconds": DEFAULT_TIMEOUT_LONG})
+    rc, txt = cap(["sudo", "lynis", "audit", "system", "--quick"], timeout=DEFAULT_TIMEOUT_LONG)
+    if rc != 0:
+        warn(s, "lynis returned non-zero", {"rc": rc})
+    write_snapshot_file(s, "lynis_audit.txt", (txt + "\n") if txt else f"[command_rc={rc}]\n")
 
 
-def run_rkhunter(s: Settings) -> None:
+def run_rkhunter_check(s: Settings) -> None:
     if not s.run_rkhunter:
         return
     if not have("rkhunter"):
         warn(s, "rkhunter not found")
         return
-    info(s, "Running rkhunter check (this can take time; output may be noisy)")
-    txt = _cap(["sudo", "rkhunter", "--check", "--sk"])
-    write_snapshot_file(s, "rkhunter_check.txt", txt + "\n")
 
-
-def run_chkrootkit(s: Settings) -> None:
-    if not s.run_chkrootkit:
-        return
-    if not have("chkrootkit"):
-        warn(s, "chkrootkit not found")
-        return
-    info(s, "Running chkrootkit (this can take time; output may be noisy)")
-    txt = _cap(["sudo", "chkrootkit"])
-    write_snapshot_file(s, "chkrootkit.txt", txt + "\n")
+    info(s, "Running rkhunter check", {"timeout_seconds": DEFAULT_TIMEOUT_RKHUNTER})
+    rc, txt = cap(["sudo", "rkhunter", "--check", "--sk"], timeout=DEFAULT_TIMEOUT_RKHUNTER)
+    if rc != 0:
+        warn(s, "rkhunter returned non-zero", {"rc": rc})
+    write_snapshot_file(s, "rkhunter_check.txt", (txt + "\n") if txt else f"[command_rc={rc}]\n")
 
 
 def nmap_localhost(s: Settings) -> None:
@@ -334,9 +449,12 @@ def nmap_localhost(s: Settings) -> None:
     if not have("nmap"):
         warn(s, "nmap not found")
         return
-    info(s, "Running nmap against localhost (opt-in)")
-    txt = _cap(["sudo", "nmap", "-sV", "-O", "127.0.0.1"])
-    write_snapshot_file(s, "nmap_localhost.txt", txt + "\n")
+
+    info(s, "Running nmap localhost scan", {"timeout_seconds": DEFAULT_TIMEOUT_LONG})
+    rc, txt = cap(["sudo", "nmap", "-sV", "127.0.0.1"], timeout=DEFAULT_TIMEOUT_LONG)
+    if rc != 0:
+        warn(s, "nmap localhost returned non-zero", {"rc": rc})
+    write_snapshot_file(s, "nmap_localhost.txt", (txt + "\n") if txt else f"[command_rc={rc}]\n")
 
 
 def lan_sweep(s: Settings) -> None:
@@ -345,10 +463,13 @@ def lan_sweep(s: Settings) -> None:
     if not have("nmap"):
         warn(s, "nmap not found")
         return
+
     cidr = s.lan_sweep_cidr.strip()
-    info(s, "Running LAN ping sweep (opt-in)", {"cidr": cidr})
-    txt = _cap(["sudo", "nmap", "-sn", cidr])
-    write_snapshot_file(s, "nmap_lan_sweep.txt", txt + "\n")
+    info(s, "Running LAN ping sweep", {"cidr": cidr, "timeout_seconds": DEFAULT_TIMEOUT_LONG})
+    rc, txt = cap(["sudo", "nmap", "-sn", cidr], timeout=DEFAULT_TIMEOUT_LONG)
+    if rc != 0:
+        warn(s, "LAN sweep returned non-zero", {"rc": rc, "cidr": cidr})
+    write_snapshot_file(s, "nmap_lan_sweep.txt", (txt + "\n") if txt else f"[command_rc={rc}]\n")
 
 
 def capture_pcap(s: Settings) -> None:
@@ -357,14 +478,29 @@ def capture_pcap(s: Settings) -> None:
     if not have("tcpdump"):
         warn(s, "tcpdump not found")
         return
+    if not have("timeout"):
+        warn(s, "timeout command not found")
+        return
+
     iface = s.capture_pcap_iface.strip()
-    secs = int(s.capture_pcap_seconds)
-    if secs < 1:
-        secs = 5
-    pcap_path = s.snapshot_root / f"tcpdump_{iface}_{secs}s.pcap"
-    info(s, "Capturing short tcpdump sample (opt-in)", {"iface": iface, "seconds": secs, "pcap": str(pcap_path)})
-    # Use timeout to avoid hanging
-    sudo(s, ["bash", "-lc", f"timeout {secs}s tcpdump -i {iface} -w '{pcap_path}' >/dev/null 2>&1 || true"], check=False)
+    secs = max(1, int(s.capture_pcap_seconds))
+    s.snapshot_dir.mkdir(parents=True, exist_ok=True)
+    pcap_path = s.snapshot_dir / f"tcpdump_{iface}_{secs}s.pcap"
+
+    info(
+        s,
+        "Capturing short tcpdump sample",
+        {"iface": iface, "seconds": secs, "pcap": str(pcap_path)},
+    )
+
+    sudo(
+        s,
+        ["timeout", f"{secs}s", "tcpdump", "-i", iface, "-w", str(pcap_path)],
+        check=False,
+        timeout=secs + 15,
+    )
+
+    sudo(s, ["chown", f"{s.operator_user}:{s.operator_user}", str(pcap_path)], check=False, timeout=DEFAULT_TIMEOUT_SHORT)
 
 
 def report_summary(s: Settings) -> None:
@@ -377,63 +513,76 @@ def report_summary(s: Settings) -> None:
             "version": VERSION,
             "system": f"{platform.system()} {platform.release()}",
             "arch": platform.machine(),
+            "script_path": str(SCRIPT_PATH),
+            "operator_user": s.operator_user,
+            "state_dir": str(s.state_dir),
             "log": str(s.log_file),
-            "snapshot_dir": str(s.snapshot_root),
+            "snapshot_dir": str(s.snapshot_dir),
         },
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="06. observer_layer.py")
+    p = argparse.ArgumentParser(prog=SCRIPT_PATH.name)
     p.add_argument("--yes", action="store_true", help="Non-interactive apt (-y)")
-    p.add_argument("--json", action="store_true", help="Emit JSON to stdout (log file always JSONL)")
+    p.add_argument("--json", action="store_true", help="Emit JSON events to stdout")
     p.add_argument("--upgrade", action="store_true", help="Explicit apt-get upgrade")
-    p.add_argument("--install-malware", action="store_true", help="Install clamav packages (install-only by default)")
-
-    p.add_argument("--run-lynis", action="store_true", help="Run lynis audit (opt-in)")
-    p.add_argument("--run-rkhunter", action="store_true", help="Run rkhunter check (opt-in)")
-    p.add_argument("--run-chkrootkit", action="store_true", help="Run chkrootkit (opt-in)")
-
-    p.add_argument("--capture-pcap", default=None, help="Capture tcpdump pcap on interface (opt-in), e.g. wlan0")
-    p.add_argument("--pcap-seconds", type=int, default=7, help="Seconds for pcap capture (default 7)")
-
-    p.add_argument("--nmap-local", action="store_true", help="Run nmap localhost scan (opt-in)")
-    p.add_argument("--lan-sweep", default=None, help="Run nmap ping sweep on CIDR (opt-in), e.g. 192.168.1.0/24")
-
-    p.add_argument("--wireshark-group", action="store_true", help="Add current user to wireshark group (logout/login required)")
-
+    p.add_argument("--run-lynis", action="store_true", help="Run lynis audit")
+    p.add_argument("--run-rkhunter", action="store_true", help="Run rkhunter check")
+    p.add_argument("--capture-pcap", default=None, help="Capture tcpdump pcap on interface, e.g. wlan0")
+    p.add_argument("--pcap-seconds", type=int, default=7, help="Seconds for pcap capture (default: 7)")
+    p.add_argument("--nmap-local", action="store_true", help="Run nmap localhost scan")
+    p.add_argument("--lan-sweep", default=None, help="Run nmap ping sweep on CIDR, e.g. 192.168.1.0/24")
     return p
+
+
+def build_settings(args: argparse.Namespace) -> Settings:
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    operator_user = detect_operator_user()
+    operator_home = detect_operator_home(operator_user)
+
+    state_dir = operator_home / ".local" / "state" / "zero-trust-desktop" / "ztd_06"
+    log_dir = state_dir / "log"
+    snapshot_dir = state_dir / "snapshots" / run_id
+    log_file = log_dir / f"{STAGE_ID}_{run_id}.jsonl"
+
+    return Settings(
+        yes=bool(args.yes),
+        json_stdout=bool(args.json),
+        upgrade=bool(args.upgrade),
+        run_lynis=bool(args.run_lynis),
+        run_rkhunter=bool(args.run_rkhunter),
+        capture_pcap_iface=(str(args.capture_pcap).strip() if args.capture_pcap else None),
+        capture_pcap_seconds=int(args.pcap_seconds),
+        nmap_local=bool(args.nmap_local),
+        lan_sweep_cidr=(str(args.lan_sweep).strip() if args.lan_sweep else None),
+        state_dir=state_dir,
+        log_dir=log_dir,
+        snapshot_dir=snapshot_dir,
+        log_file=log_file,
+        run_id=run_id,
+        operator_user=operator_user,
+        operator_home=operator_home,
+    )
 
 
 def main() -> int:
     args = build_parser().parse_args()
-
-    s = Settings(
-        yes=bool(args.yes),
-        json_stdout=bool(args.json),
-
-        upgrade=bool(args.upgrade),
-        install_malware=bool(args.install_malware),
-
-        run_lynis=bool(args.run_lynis),
-        run_rkhunter=bool(args.run_rkhunter),
-        run_chkrootkit=bool(args.run_chkrootkit),
-
-        capture_pcap_iface=(str(args.capture_pcap).strip() if args.capture_pcap else None),
-        capture_pcap_seconds=int(args.pcap_seconds),
-
-        nmap_local=bool(args.nmap_local),
-        lan_sweep_cidr=(str(args.lan_sweep).strip() if args.lan_sweep else None),
-
-        wireshark_group=bool(args.wireshark_group),
-
-        log_file=LOG_FILE,
-        snapshot_root=SNAPSHOT_ROOT,
-    )
+    s = build_settings(args)
 
     require_debian_like(s)
+    sudo_preflight(s)
 
-    info(s, f"{APP_NAME} — {STAGE_NAME} start", {"version": VERSION, "log": str(s.log_file)})
+    info(
+        s,
+        f"{APP_NAME} — {STAGE_NAME} start",
+        {
+            "version": VERSION,
+            "script_path": str(SCRIPT_PATH),
+            "script_dir": str(SCRIPT_DIR),
+            "log": str(s.log_file),
+        },
+    )
 
     info(s, "[1] apt update")
     apt_update(s)
@@ -442,31 +591,67 @@ def main() -> int:
         info(s, "[1b] apt upgrade (explicit)")
         apt_upgrade(s)
 
-    info(s, "[2] install observer/tool arsenal (idempotent)")
+    info(s, "[2] install observer toolkit (idempotent)")
     apt_install_missing(s, PKGS_OBSERVER_CORE)
-
-    if s.install_malware:
-        info(s, "[2b] install malware scanner packages (clamav)")
-        apt_install_missing(s, PKGS_MALWARE)
-
-    if s.wireshark_group:
-        maybe_add_wireshark_group(s)
 
     info(s, "[3] baseline snapshots")
     baseline_snapshots(s)
 
-    info(s, "[4] optional audits/scans (explicit only)")
-    run_lynis(s)
-    run_rkhunter(s)
-    run_chkrootkit(s)
+    info(s, "[4] optional audits / scans")
+    run_lynis_audit(s)
+    run_rkhunter_check(s)
     nmap_localhost(s)
     lan_sweep(s)
     capture_pcap(s)
 
     report_summary(s)
-    info(s, f"{STAGE_NAME} complete", {"log": str(s.log_file), "snapshot_dir": str(s.snapshot_root)})
+    info(s, f"{STAGE_NAME} complete", {"log": str(s.log_file), "snapshot_dir": str(s.snapshot_dir)})
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ================================================================
+# INSTRUCTIONS
+# ================================================================
+#
+# Repo directory:
+#   mkdir -p ~/ztd
+#
+# Save file:
+#   ~/ztd/06_observer_layer.py
+#
+# Make executable:
+#   chmod +x ~/ztd/06_observer_layer.py
+#
+# Baseline run:
+#   python3 ~/ztd/06_observer_layer.py --yes
+#
+# Full local host audit:
+#   python3 ~/ztd/06_observer_layer.py --yes --run-lynis --run-rkhunter --nmap-local
+#
+# Optional packet capture:
+#   python3 ~/ztd/06_observer_layer.py --yes --capture-pcap wlan0 --pcap-seconds 10
+#
+# Optional LAN sweep:
+#   python3 ~/ztd/06_observer_layer.py --yes --lan-sweep 192.168.1.0/24
+#
+# Syntax check:
+#   python3 -m py_compile ~/ztd/06_observer_layer.py
+#
+# Output location:
+#   ~/.local/state/zero-trust-desktop/ztd_06/
+#
+# Notes:
+#   - Script works regardless of current directory.
+#   - Script resolves its own path via __file__.
+#   - State is written under the real operator's home directory.
+#   - This version intentionally excludes:
+#       * wireshark group modification
+#       * chkrootkit
+#       * clamav install branch
+#       * default firewall package installation
+#
+# ================================================================
