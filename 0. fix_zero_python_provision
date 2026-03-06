@@ -1,100 +1,165 @@
 #!/usr/bin/env python3
 """
-Zero Python Provision (ZPP) — Product Edition
-Version: 0.0.1
-Suite repo umbrella: Zero Trust Desktop (ZTD)
+Zero Python Provision (ZPP) — Hardened Resilient Edition
+Version: 0.2.1
 
-What this is
-------------
-A Python-first workstation provisioner for Ubuntu/Debian that installs what you need,
-leaves alone what you already have, and logs everything so it’s auditable.
-
-Design principles
------------------
-- Idempotent: re-running is safe.
-- Minimal assumptions: Debian/Ubuntu only.
-- No removals by default.
-- Behavior-changing actions (services, firewall, printing) are explicit flags.
-- Operates as a single self-contained Python file (easy to paste, store, ship).
-
-Quickstart
-----------
-  python3 zero_python_provision.py bootstrap --yes --profile dev
-  python3 zero_python_provision.py python --yes --venv --venv-libs --pipx-tools
-  python3 zero_python_provision.py verify
-
-Profiles
---------
-- dev:    Python-ready developer baseline (Python + build + core)
-- secure: Adds security packages (ufw/fail2ban/auditd) but does NOT enable them unless asked
-- full:   Adds networking stack (wireguard/openvpn/tor/nginx) but does NOT enable services unless asked
+Single-file Ubuntu/Debian provisioner that:
+- installs only missing packages
+- continues section-by-section on failure
+- logs every action
+- prints and writes a final summary report
+- avoids risky Python system mutation by default
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import platform
+import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, asdict
+import traceback
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 
-# -----------------------------
-# Versioning / Branding
-# -----------------------------
+# ============================================================================
+# Identity
+# ============================================================================
+
 APP_NAME = "Zero Python Provision"
 APP_ID = "zpp"
-SUITE_NAME = "Zero Trust Desktop"
-SUITE_ID = "ztd"
-VERSION = "0.0.1"
+VERSION = "0.2.1"
 
 
-# -----------------------------
-# Paths / Defaults
-# -----------------------------
+# ============================================================================
+# Paths
+# ============================================================================
+
 HOME = Path.home()
-STATE_DIR = HOME / ".local" / "state" / "zero-trust-desktop" / APP_ID
+STATE_DIR = HOME / ".local" / "state" / APP_ID
 LOG_DIR = STATE_DIR / "log"
+REPORT_DIR = STATE_DIR / "report"
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 PY_WORKDIR = HOME / "python-projects"
 PY_DEFAULT_VENV = PY_WORKDIR / "default"
 
+DEFAULT_LOG_FILE = LOG_DIR / f"{APP_ID}_{RUN_ID}.jsonl"
+DEFAULT_REPORT_FILE = REPORT_DIR / f"{APP_ID}_{RUN_ID}_summary.json"
 
-# -----------------------------
+
+# ============================================================================
+# Defaults
+# ============================================================================
+
+APT_ENV = {
+    "DEBIAN_FRONTEND": "noninteractive",
+    "NEEDRESTART_MODE": "a",
+}
+
+DEFAULT_COMMAND_TIMEOUT = 1800
+SHORT_COMMAND_TIMEOUT = 120
+
+
+# ============================================================================
 # Package sets
-# -----------------------------
+# ============================================================================
+
 PKGS_CORE = [
-    "ca-certificates", "curl", "wget", "git", "unzip", "zip", "tar",
-    "jq", "ripgrep", "tree", "htop", "net-tools",
-    "software-properties-common", "gnupg", "lsb-release", "apt-transport-https",
+    "ca-certificates",
+    "curl",
+    "wget",
+    "git",
+    "unzip",
+    "zip",
+    "tar",
+    "jq",
+    "ripgrep",
+    "tree",
+    "htop",
+    "net-tools",
+    "software-properties-common",
+    "gnupg",
+    "lsb-release",
+    "apt-transport-https",
 ]
+
 PKGS_BUILD = [
-    "build-essential", "gcc", "g++", "make", "dkms", "cmake", "pkg-config",
-    "openssl", "libssl-dev", "libffi-dev",
+    "build-essential",
+    "gcc",
+    "g++",
+    "make",
+    "dkms",
+    "cmake",
+    "pkg-config",
+    "openssl",
+    "libssl-dev",
+    "libffi-dev",
 ]
-PKGS_SEC = ["ufw", "fail2ban", "auditd", "audispd-plugins"]
-PKGS_PY = ["python3", "python3-full", "python3-pip", "python3-venv", "python3-dev", "pipx"]
-PKGS_NET = ["tor", "nginx", "openvpn", "wireguard", "wireguard-tools", "network-manager-openvpn"]
 
-PIPX_TOOLS = ["virtualenv", "ipython", "httpie", "rich-cli"]
-VENV_LIBS = ["numpy", "pandas", "requests", "psutil", "rich", "flask", "fastapi", "uvicorn"]
+PKGS_SEC = [
+    "ufw",
+    "fail2ban",
+    "auditd",
+    "audispd-plugins",
+]
+
+PKGS_PY = [
+    "python3",
+    "python3-full",
+    "python3-pip",
+    "python3-venv",
+    "python3-dev",
+    "pipx",
+]
+
+PKGS_NET = [
+    "tor",
+    "nginx",
+    "openvpn",
+    "wireguard",
+    "wireguard-tools",
+    "network-manager-openvpn",
+]
+
+PKGS_PY_ALIAS = [
+    "python-is-python3",
+]
+
+PIPX_TOOLS = [
+    "virtualenv",
+    "ipython",
+    "httpie",
+    "rich-cli",
+]
+
+VENV_LIBS = [
+    "numpy",
+    "pandas",
+    "requests",
+    "psutil",
+    "rich",
+    "flask",
+    "fastapi",
+    "uvicorn",
+]
 
 
-# -----------------------------
-# Data structures
-# -----------------------------
+# ============================================================================
+# Data
+# ============================================================================
+
 @dataclass
 class Settings:
     yes: bool
-    json: bool
-    upgrade: bool
+    json_stdout: bool
+    dry_run: bool
     profile: str
+    upgrade: bool
     python_link: bool
     pipx_tools: bool
     venv: bool
@@ -103,6 +168,7 @@ class Settings:
     firewall_baseline: bool
     disable_printing: bool
     log_file: Path
+    report_file: Path
 
 
 @dataclass
@@ -113,12 +179,106 @@ class Event:
     data: Optional[dict] = None
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+@dataclass
+class CommandResult:
+    rc: int
+    stdout: str
+    stderr: str
+
+
+@dataclass
+class SectionResult:
+    name: str
+    status: str
+    started_at: str
+    ended_at: str
+    error_count: int
+    warning_count: int
+
+
+class RuntimeState:
+    def __init__(self) -> None:
+        self.section_stack: List[str] = []
+        self.section_results: List[SectionResult] = []
+        self.errors: List[dict] = []
+        self.warnings: List[dict] = []
+        self.command_count = 0
+        self.command_failures = 0
+
+    def current_section(self) -> str:
+        return self.section_stack[-1] if self.section_stack else "global"
+
+
+STATE = RuntimeState()
+
+
+# ============================================================================
+# Logging
+# ============================================================================
+
 def now_ts() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def append_text(path: Path, text: str) -> None:
+    ensure_parent(path)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def emit(s: Settings, level: str, msg: str, data: Optional[dict] = None) -> None:
+    event = Event(ts=now_ts(), level=level, msg=msg, data=data)
+    record = asdict(event)
+
+    if s.json_stdout:
+        print(json.dumps(record, ensure_ascii=False))
+    else:
+        line = f"[{event.ts}] {event.level}: {event.msg}"
+        if data:
+            line += f" | {json.dumps(data, ensure_ascii=False, sort_keys=True)}"
+        print(line)
+
+    try:
+        append_text(s.log_file, json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        print(f"[{event.ts}] ERROR: failed to write log file", file=sys.stderr)
+
+
+def info(s: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(s, "INFO", msg, data)
+
+
+def warn(s: Settings, msg: str, data: Optional[dict] = None) -> None:
+    STATE.warnings.append(
+        {
+            "section": STATE.current_section(),
+            "msg": msg,
+            "data": data or {},
+            "ts": now_ts(),
+        }
+    )
+    emit(s, "WARN", msg, data)
+
+
+def err(s: Settings, msg: str, data: Optional[dict] = None) -> None:
+    STATE.errors.append(
+        {
+            "section": STATE.current_section(),
+            "msg": msg,
+            "data": data or {},
+            "ts": now_ts(),
+        }
+    )
+    emit(s, "ERROR", msg, data)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
 
 def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
@@ -131,297 +291,707 @@ def read_text(path: Path) -> str:
         return ""
 
 
-def write_append(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(text)
+def run_command(
+    s: Settings,
+    cmd: Sequence[str],
+    *,
+    check: bool = False,
+    sudo: bool = False,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> CommandResult:
+    full_cmd = ["sudo", *cmd] if sudo else list(cmd)
+    STATE.command_count += 1
 
+    info(
+        s,
+        "Running command",
+        {
+            "section": STATE.current_section(),
+            "cmd": full_cmd,
+            "dry_run": s.dry_run,
+            "timeout_sec": timeout,
+        },
+    )
 
-def emit(s: Settings, event: Event) -> None:
-    # Console output
-    if s.json:
-        print(json.dumps(asdict(event), ensure_ascii=False))
+    if s.dry_run:
+        return CommandResult(rc=0, stdout="", stderr="")
+
+    env = None
+    if extra_env:
+        env = {**os.environ, **extra_env}
+
+    try:
+        proc = subprocess.run(
+            full_cmd,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        STATE.command_failures += 1
+        err(s, "Command executable not found", {"cmd": full_cmd, "exception": repr(exc)})
+        if check:
+            raise
+        return CommandResult(rc=127, stdout="", stderr=str(exc))
+    except subprocess.TimeoutExpired as exc:
+        STATE.command_failures += 1
+        err(
+            s,
+            "Command timed out",
+            {
+                "cmd": full_cmd,
+                "timeout_sec": timeout,
+                "stdout_first": ((exc.stdout or "").strip().splitlines()[:1] or [""])[0],
+                "stderr_first": ((exc.stderr or "").strip().splitlines()[:1] or [""])[0],
+            },
+        )
+        if check:
+            raise RuntimeError(f"Command timed out: {' '.join(full_cmd)}")
+        return CommandResult(rc=124, stdout=exc.stdout or "", stderr=exc.stderr or "")
+    except Exception as exc:
+        STATE.command_failures += 1
+        err(s, "Command execution exception", {"cmd": full_cmd, "exception": repr(exc)})
+        if check:
+            raise
+        return CommandResult(rc=1, stdout="", stderr=str(exc))
+
+    result = CommandResult(
+        rc=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+    )
+
+    preview = {
+        "rc": result.rc,
+        "stdout_first": (result.stdout.strip().splitlines()[:1] or [""])[0],
+        "stderr_first": (result.stderr.strip().splitlines()[:1] or [""])[0],
+    }
+
+    if result.rc == 0:
+        info(s, "Command succeeded", preview)
     else:
-        print(f"[{event.ts}] {event.level}: {event.msg}")
+        STATE.command_failures += 1
+        err(s, "Command failed", {"cmd": full_cmd, **preview})
+        if check:
+            raise RuntimeError(f"Command failed: {' '.join(full_cmd)} (rc={result.rc})")
 
-    # File output (always structured JSONL)
-    write_append(s.log_file, json.dumps(asdict(event), ensure_ascii=False) + "\n")
-
-
-def info(s: Settings, msg: str, data: Optional[dict] = None) -> None:
-    emit(s, Event(ts=now_ts(), level="INFO", msg=msg, data=data))
+    return result
 
 
-def warn(s: Settings, msg: str, data: Optional[dict] = None) -> None:
-    emit(s, Event(ts=now_ts(), level="WARN", msg=msg, data=data))
-
-
-def err(s: Settings, msg: str, data: Optional[dict] = None) -> None:
-    emit(s, Event(ts=now_ts(), level="ERROR", msg=msg, data=data))
-
-
-def run(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
-    # Always log the command
-    info(s, "$ " + " ".join(cmd))
-    p = subprocess.run(cmd, text=True, capture_output=True)
-    if check and p.returncode != 0:
-        err(s, "Command failed", {"rc": p.returncode, "cmd": cmd, "stderr": p.stderr.strip()})
-        raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
-    return p.returncode, p.stdout, p.stderr
-
-
-def sudo(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
-    return run(s, ["sudo"] + cmd, check=check)
-
-
-def require_debian_like(s: Settings) -> None:
-    if not (Path("/etc/os-release").exists() and have("apt-get") and have("dpkg")):
-        err(s, "Unsupported platform. Debian/Ubuntu with apt-get/dpkg required.")
-        raise SystemExit(2)
-
-
-def dpkg_installed(pkg: str) -> bool:
-    p = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return p.returncode == 0
-
-
-# -----------------------------
-# Core operations
-# -----------------------------
-def apt_update(s: Settings) -> None:
-    args = ["apt-get", "update"]
-    if s.yes:
-        args.append("-y")
-    sudo(s, args)
-
-
-def apt_upgrade(s: Settings) -> None:
-    args = ["apt-get", "upgrade"]
-    if s.yes:
-        args.append("-y")
-    sudo(s, args)
-
-
-def apt_install_missing(s: Settings, pkgs: Iterable[str]) -> None:
-    pkgs = list(pkgs)
-    missing = [p for p in pkgs if not dpkg_installed(p)]
-    for p in pkgs:
-        if p in missing:
-            info(s, f"Installing missing package: {p}")
-        else:
-            info(s, f"Already installed: {p}")
-
-    if not missing:
-        return
-
-    args = ["apt-get", "install"]
-    if s.yes:
-        args.append("-y")
-    args += missing
-    sudo(s, args)
-
-
-def ensure_local_bin_path(s: Settings) -> None:
-    (HOME / ".local" / "bin").mkdir(parents=True, exist_ok=True)
-    bashrc = HOME / ".bashrc"
-    line = 'export PATH="$HOME/.local/bin:$PATH"'
-    content = read_text(bashrc)
-    if line in content:
-        info(s, "~/.local/bin already present in ~/.bashrc")
-        return
-
-    # backup once per machine
-    backup = HOME / f".bashrc.{APP_ID}.bak"
-    if bashrc.exists() and not backup.exists():
-        info(s, f"Backing up ~/.bashrc to {backup.name}")
-        backup.write_text(content, encoding="utf-8")
-
-    info(s, "Appending ~/.local/bin PATH line to ~/.bashrc")
-    write_append(bashrc, "\n" + line + "\n")
-
-
-def ensure_python_symlink(s: Settings) -> None:
-    if not s.python_link:
-        return
-    if have("python"):
-        info(s, "python already exists on PATH")
-        return
-    if not have("python3"):
-        warn(s, "python3 not found yet (install Python packages first)")
-        return
-    info(s, "Creating /usr/local/bin/python -> /usr/bin/python3")
-    sudo(s, ["ln", "-sf", "/usr/bin/python3", "/usr/local/bin/python"], check=False)
-
-
-def pip_user_upgrade(s: Settings) -> None:
-    # Best-effort by design
-    info(s, "Upgrading pip/setuptools/wheel (user scope)")
-    subprocess.run(
-        ["python3", "-m", "pip", "install", "--user", "--upgrade", "pip", "setuptools", "wheel", "--break-system-packages"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+def apt_run(s: Settings, args: Sequence[str], *, check: bool = False) -> CommandResult:
+    return run_command(
+        s,
+        ["apt-get", *args],
+        sudo=True,
+        check=check,
+        timeout=DEFAULT_COMMAND_TIMEOUT,
+        extra_env=APT_ENV,
     )
 
 
+def dpkg_installed(pkg: str) -> bool:
+    proc = subprocess.run(
+        ["dpkg-query", "-W", "-f=${Status}", pkg],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc.returncode == 0 and "install ok installed" in (proc.stdout or "")
+
+
+def systemd_unit_exists(s: Settings, name: str) -> bool:
+    if not have("systemctl"):
+        return False
+
+    result = run_command(
+        s,
+        ["systemctl", "list-unit-files", f"{name}.service", "--no-legend", "--no-pager"],
+        check=False,
+        timeout=SHORT_COMMAND_TIMEOUT,
+    )
+    if result.rc == 0 and f"{name}.service" in result.stdout:
+        return True
+
+    candidates = [
+        Path("/etc/systemd/system") / f"{name}.service",
+        Path("/lib/systemd/system") / f"{name}.service",
+        Path("/usr/lib/systemd/system") / f"{name}.service",
+    ]
+    return any(path.exists() for path in candidates)
+
+
+def require_debian_like(s: Settings) -> None:
+    ok = Path("/etc/os-release").exists() and have("apt-get") and have("dpkg-query")
+    if not ok:
+        err(
+            s,
+            "Unsupported platform",
+            {
+                "required": "Debian/Ubuntu with apt-get and dpkg-query",
+                "have_apt_get": have("apt-get"),
+                "have_dpkg_query": have("dpkg-query"),
+                "os_release_exists": Path("/etc/os-release").exists(),
+            },
+        )
+        raise SystemExit(2)
+
+    os_release = read_text(Path("/etc/os-release")).lower()
+    if "debian" not in os_release and "ubuntu" not in os_release:
+        warn(s, "OS is not explicitly Debian/Ubuntu; continuing because apt-get exists")
+
+
+def preflight_apt_health(s: Settings) -> None:
+    info(s, "Checking dpkg audit state")
+    run_command(s, ["dpkg", "--audit"], check=False, timeout=SHORT_COMMAND_TIMEOUT)
+
+
+# ============================================================================
+# Section runner
+# ============================================================================
+
+def run_section(
+    s: Settings,
+    name: str,
+    fn: Callable[..., None],
+    *args,
+    **kwargs,
+) -> None:
+    started = now_ts()
+    STATE.section_stack.append(name)
+    errors_before = len(STATE.errors)
+    warnings_before = len(STATE.warnings)
+    status = "ok"
+
+    info(s, f"SECTION START: {name}")
+    try:
+        fn(*args, **kwargs)
+    except Exception as exc:
+        status = "failed"
+        err(
+            s,
+            f"Section exception: {name}",
+            {
+                "exception": repr(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+    finally:
+        ended = now_ts()
+        STATE.section_results.append(
+            SectionResult(
+                name=name,
+                status=status,
+                started_at=started,
+                ended_at=ended,
+                error_count=len(STATE.errors) - errors_before,
+                warning_count=len(STATE.warnings) - warnings_before,
+            )
+        )
+        info(
+            s,
+            f"SECTION END: {name}",
+            {
+                "status": status,
+                "errors": len(STATE.errors) - errors_before,
+                "warnings": len(STATE.warnings) - warnings_before,
+            },
+        )
+        STATE.section_stack.pop()
+
+
+# ============================================================================
+# Package operations
+# ============================================================================
+
+def apt_update(s: Settings) -> None:
+    apt_run(s, ["update"], check=False)
+
+
+def apt_upgrade(s: Settings) -> None:
+    args: List[str] = []
+    if s.yes:
+        args.append("-y")
+    args.append("upgrade")
+    apt_run(s, args, check=False)
+
+
+def apt_install_missing(s: Settings, pkgs: Iterable[str]) -> None:
+    requested = list(dict.fromkeys(pkgs))
+    missing = [pkg for pkg in requested if not dpkg_installed(pkg)]
+
+    for pkg in requested:
+        if pkg in missing:
+            info(s, "Package missing", {"package": pkg})
+        else:
+            info(s, "Package already installed", {"package": pkg})
+
+    if not missing:
+        info(s, "No missing packages in this section")
+        return
+
+    args: List[str] = []
+    if s.yes:
+        args.append("-y")
+    args.extend(["install", *missing])
+    apt_run(s, args, check=False)
+
+
+# ============================================================================
+# File / shell
+# ============================================================================
+
+def ensure_local_bin_path(s: Settings) -> None:
+    local_bin = HOME / ".local" / "bin"
+    if not s.dry_run:
+        local_bin.mkdir(parents=True, exist_ok=True)
+
+    bashrc = HOME / ".bashrc"
+    export_line = 'export PATH="$HOME/.local/bin:$PATH"'
+    content = read_text(bashrc)
+
+    if export_line in content:
+        info(s, "~/.local/bin already present in ~/.bashrc")
+        return
+
+    backup = HOME / f".bashrc.{APP_ID}.bak"
+    if bashrc.exists() and not backup.exists() and not s.dry_run:
+        backup.write_text(content, encoding="utf-8")
+        info(s, "Created ~/.bashrc backup", {"backup": str(backup)})
+
+    if not s.dry_run:
+        append_text(bashrc, "\n" + export_line + "\n")
+    info(s, "Appended ~/.local/bin to ~/.bashrc")
+
+
+# ============================================================================
+# Python / pipx / venv
+# ============================================================================
+
+def ensure_python_alias_package(s: Settings) -> None:
+    if not s.python_link:
+        info(s, "python alias not requested")
+        return
+
+    if have("python"):
+        info(s, "python already exists on PATH")
+        return
+
+    info(s, "Ensuring python command via python-is-python3 package")
+    apt_install_missing(s, PKGS_PY_ALIAS)
+
+
 def pipx_ensurepath(s: Settings) -> None:
-    info(s, "pipx ensurepath (best-effort)")
-    subprocess.run(["pipx", "ensurepath"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not have("pipx"):
+        warn(s, "pipx not found; skipping pipx ensurepath")
+        return
+    run_command(s, ["pipx", "ensurepath"], check=False, timeout=SHORT_COMMAND_TIMEOUT)
 
 
 def pipx_install_tools(s: Settings) -> None:
     if not s.pipx_tools:
+        info(s, "pipx tools not requested")
         return
+
+    if not have("pipx"):
+        warn(s, "pipx not found; cannot install pipx tools")
+        return
+
     for tool in PIPX_TOOLS:
-        info(s, f"pipx install (best-effort): {tool}")
-        subprocess.run(["pipx", "install", tool], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        run_command(s, ["pipx", "install", tool], check=False, timeout=DEFAULT_COMMAND_TIMEOUT)
 
 
 def ensure_default_venv(s: Settings) -> None:
     if not s.venv:
+        info(s, "venv creation not requested")
         return
-    info(s, f"Ensuring default venv exists: {PY_DEFAULT_VENV}")
-    if PY_DEFAULT_VENV.exists() and (PY_DEFAULT_VENV / "bin" / "python").exists():
-        info(s, "Default venv already exists")
+
+    venv_python = PY_DEFAULT_VENV / "bin" / "python"
+    if venv_python.exists():
+        info(s, "Default venv already exists", {"path": str(PY_DEFAULT_VENV)})
         return
-    PY_WORKDIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["python3", "-m", "venv", str(PY_DEFAULT_VENV)], check=False)
+
+    if not have("python3"):
+        err(s, "python3 missing; cannot create venv")
+        return
+
+    if not s.dry_run:
+        PY_WORKDIR.mkdir(parents=True, exist_ok=True)
+
+    run_command(
+        s,
+        ["python3", "-m", "venv", str(PY_DEFAULT_VENV)],
+        check=False,
+        timeout=DEFAULT_COMMAND_TIMEOUT,
+    )
 
 
 def install_venv_libs(s: Settings) -> None:
     if not s.venv_libs:
+        info(s, "venv libs not requested")
         return
-    pip = PY_DEFAULT_VENV / "bin" / "pip"
-    if not pip.exists():
-        warn(s, "Venv pip not found; run with --venv first")
+
+    pip_bin = PY_DEFAULT_VENV / "bin" / "pip"
+    if not pip_bin.exists():
+        warn(s, "Default venv pip not found; skipping venv libs install")
         return
-    info(s, f"Installing libs into venv: {' '.join(VENV_LIBS)} (best-effort)")
-    subprocess.run([str(pip), "install", "-U", *VENV_LIBS], check=False)
+
+    run_command(
+        s,
+        [str(pip_bin), "install", "--upgrade", *VENV_LIBS],
+        check=False,
+        timeout=DEFAULT_COMMAND_TIMEOUT,
+    )
 
 
-def enable_services(s: Settings) -> None:
+# ============================================================================
+# Services / firewall
+# ============================================================================
+
+def enable_requested_services(s: Settings) -> None:
     if not s.enable_services:
+        info(s, "service enablement not requested")
         return
+
+    if not have("systemctl"):
+        warn(s, "systemctl not found; cannot enable services")
+        return
+
     services = ["ufw", "fail2ban", "auditd", "tor", "nginx"]
-    for name in services:
-        info(s, f"Enabling service: {name}")
-        sudo(s, ["systemctl", "enable", "--now", name], check=False)
+    for svc in services:
+        if not systemd_unit_exists(s, svc):
+            warn(s, "Service unit not found; skipping enable", {"service": svc})
+            continue
+        run_command(
+            s,
+            ["systemctl", "enable", "--now", svc],
+            sudo=True,
+            check=False,
+            timeout=SHORT_COMMAND_TIMEOUT,
+        )
 
 
-def firewall_baseline(s: Settings) -> None:
+def apply_firewall_baseline(s: Settings) -> None:
     if not s.firewall_baseline:
+        info(s, "firewall baseline not requested")
         return
-    info(s, "Applying ufw baseline (allow OpenSSH + enable)")
-    sudo(s, ["ufw", "allow", "OpenSSH"], check=False)
-    sudo(s, ["ufw", "--force", "enable"], check=False)
+
+    if not have("ufw"):
+        warn(s, "ufw not found; cannot apply firewall baseline")
+        return
+
+    run_command(s, ["ufw", "allow", "OpenSSH"], sudo=True, check=False, timeout=SHORT_COMMAND_TIMEOUT)
+    run_command(s, ["ufw", "--force", "enable"], sudo=True, check=False, timeout=SHORT_COMMAND_TIMEOUT)
 
 
-def disable_printing(s: Settings) -> None:
+def disable_printing_services(s: Settings) -> None:
     if not s.disable_printing:
+        info(s, "printing disable not requested")
         return
-    info(s, "Disabling printing services (cups, cups-browsed)")
-    sudo(s, ["systemctl", "disable", "--now", "cups", "cups-browsed"], check=False)
+
+    if not have("systemctl"):
+        warn(s, "systemctl not found; cannot disable printing services")
+        return
+
+    for svc in ["cups", "cups-browsed"]:
+        if not systemd_unit_exists(s, svc):
+            warn(s, "Printing service unit not found; skipping", {"service": svc})
+            continue
+        run_command(
+            s,
+            ["systemctl", "disable", "--now", svc],
+            sudo=True,
+            check=False,
+            timeout=SHORT_COMMAND_TIMEOUT,
+        )
 
 
-def verify(s: Settings) -> None:
+# ============================================================================
+# Verification
+# ============================================================================
+
+def verify_environment(s: Settings) -> None:
     info(
         s,
-        "Verification",
+        "Verification started",
         {
-            "app": APP_ID,
-            "app_name": APP_NAME,
-            "suite": SUITE_ID,
-            "suite_name": SUITE_NAME,
+            "app": APP_NAME,
+            "app_id": APP_ID,
             "version": VERSION,
-            "system": f"{platform.system()} {platform.release()}",
-            "arch": platform.machine(),
-            "python": sys.version.splitlines()[0],
+            "python_runtime": sys.version.splitlines()[0],
         },
     )
 
-    cmds = [
-        ["python3", "--version"],
-        ["pip3", "--version"],
-        ["pipx", "--version"],
-        ["gcc", "--version"],
-        ["code", "--version"],
-    ]
-    for cmd in cmds:
-        exe = cmd[0]
+    checks: Dict[str, List[str]] = {
+        "python3": ["python3", "--version"],
+        "pip3": ["pip3", "--version"],
+        "pipx": ["pipx", "--version"],
+        "gcc": ["gcc", "--version"],
+        "git": ["git", "--version"],
+    }
+
+    optional_checks: Dict[str, List[str]] = {
+        "python": ["python", "--version"],
+    }
+
+    for exe, cmd in checks.items():
         if not have(exe):
-            warn(s, f"{exe} not found")
+            err(s, "Required command missing", {"command": exe})
             continue
-        p = subprocess.run(cmd, text=True, capture_output=True)
-        out = (p.stdout.strip() or p.stderr.strip()).splitlines()
-        first = out[0] if out else ""
-        info(s, f"{exe}: {first}")
+        run_command(s, cmd, check=False, timeout=SHORT_COMMAND_TIMEOUT)
+
+    for exe, cmd in optional_checks.items():
+        if not have(exe):
+            warn(s, "Optional command missing", {"command": exe})
+            continue
+        run_command(s, cmd, check=False, timeout=SHORT_COMMAND_TIMEOUT)
+
+    if have("ufw"):
+        run_command(s, ["ufw", "status"], sudo=True, check=False, timeout=SHORT_COMMAND_TIMEOUT)
 
     if have("systemctl"):
-        subprocess.run(["systemctl", "--failed", "--no-pager"], check=False)
+        run_command(s, ["systemctl", "--failed", "--no-pager"], check=False, timeout=SHORT_COMMAND_TIMEOUT)
+    else:
+        warn(s, "systemctl missing; cannot inspect failed services")
 
 
-# -----------------------------
-# Profile logic
-# -----------------------------
+# ============================================================================
+# Reports
+# ============================================================================
+
+def build_summary(s: Settings) -> dict:
+    return {
+        "app": APP_NAME,
+        "app_id": APP_ID,
+        "version": VERSION,
+        "run_id": RUN_ID,
+        "generated_at": now_ts(),
+        "log_file": str(s.log_file),
+        "report_file": str(s.report_file),
+        "settings": {
+            "yes": s.yes,
+            "json_stdout": s.json_stdout,
+            "dry_run": s.dry_run,
+            "profile": s.profile,
+            "upgrade": s.upgrade,
+            "python_link": s.python_link,
+            "pipx_tools": s.pipx_tools,
+            "venv": s.venv,
+            "venv_libs": s.venv_libs,
+            "enable_services": s.enable_services,
+            "firewall_baseline": s.firewall_baseline,
+            "disable_printing": s.disable_printing,
+        },
+        "commands": {
+            "count": STATE.command_count,
+            "failures": STATE.command_failures,
+        },
+        "sections": [asdict(item) for item in STATE.section_results],
+        "errors": STATE.errors,
+        "warnings": STATE.warnings,
+        "status": "ok" if not STATE.errors else "completed_with_errors",
+    }
+
+
+def write_summary_report(s: Settings) -> None:
+    summary = build_summary(s)
+    try:
+        ensure_parent(s.report_file)
+        if not s.dry_run:
+            s.report_file.write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        info(s, "Summary report written", {"path": str(s.report_file)})
+    except Exception as exc:
+        err(s, "Failed to write summary report", {"exception": repr(exc), "path": str(s.report_file)})
+
+
+def print_final_report(s: Settings) -> None:
+    summary = build_summary(s)
+
+    if s.json_stdout:
+        print(json.dumps({"final_report": summary}, ensure_ascii=False))
+        return
+
+    print()
+    print("=" * 78)
+    print(f"{APP_NAME} — FINAL REPORT")
+    print("=" * 78)
+    print(f"Version:           {VERSION}")
+    print(f"Status:            {summary['status']}")
+    print(f"Commands run:      {summary['commands']['count']}")
+    print(f"Command failures:  {summary['commands']['failures']}")
+    print(f"Warnings:          {len(summary['warnings'])}")
+    print(f"Errors:            {len(summary['errors'])}")
+    print(f"Log file:          {s.log_file}")
+    print(f"Summary report:    {s.report_file}")
+    print()
+    print("Sections:")
+    for sec in summary["sections"]:
+        print(
+            f"  - {sec['name']}: {sec['status']} "
+            f"(errors={sec['error_count']}, warnings={sec['warning_count']})"
+        )
+
+    if summary["errors"]:
+        print()
+        print("Errors:")
+        for idx, item in enumerate(summary["errors"], 1):
+            print(f"  {idx}. [{item['section']}] {item['msg']}")
+            if item.get("data"):
+                print(f"     {json.dumps(item['data'], ensure_ascii=False)}")
+
+    if summary["warnings"]:
+        print()
+        print("Warnings:")
+        for idx, item in enumerate(summary["warnings"], 1):
+            print(f"  {idx}. [{item['section']}] {item['msg']}")
+            if item.get("data"):
+                print(f"     {json.dumps(item['data'], ensure_ascii=False)}")
+
+    print("=" * 78)
+
+
+# ============================================================================
+# Profiles
+# ============================================================================
+
 def profile_packages(profile: str) -> List[str]:
     profile = profile.lower()
     if profile == "dev":
-        return PKGS_CORE + PKGS_BUILD + PKGS_PY
+        return [*PKGS_CORE, *PKGS_BUILD, *PKGS_PY]
     if profile == "secure":
-        return PKGS_CORE + PKGS_BUILD + PKGS_PY + PKGS_SEC
+        return [*PKGS_CORE, *PKGS_BUILD, *PKGS_PY, *PKGS_SEC]
     if profile == "full":
-        return PKGS_CORE + PKGS_BUILD + PKGS_PY + PKGS_SEC + PKGS_NET
-    # default fallback
-    return PKGS_PY
+        return [*PKGS_CORE, *PKGS_BUILD, *PKGS_PY, *PKGS_SEC, *PKGS_NET]
+    return [*PKGS_PY]
 
 
-# -----------------------------
+# ============================================================================
+# Commands
+# ============================================================================
+
+def cmd_bootstrap(s: Settings) -> None:
+    require_debian_like(s)
+
+    info(s, "Bootstrap start", {"profile": s.profile, "version": VERSION})
+
+    run_section(s, "preflight_apt_health", preflight_apt_health, s)
+    run_section(s, "apt_update", apt_update, s)
+
+    if s.upgrade:
+        run_section(s, "apt_upgrade", apt_upgrade, s)
+
+    run_section(s, "apt_install_profile_packages", apt_install_missing, s, profile_packages(s.profile))
+    run_section(s, "ensure_local_bin_path", ensure_local_bin_path, s)
+    run_section(s, "ensure_python_alias_package", ensure_python_alias_package, s)
+    run_section(s, "pipx_ensurepath", pipx_ensurepath, s)
+    run_section(s, "pipx_install_tools", pipx_install_tools, s)
+    run_section(s, "ensure_default_venv", ensure_default_venv, s)
+    run_section(s, "install_venv_libs", install_venv_libs, s)
+    run_section(s, "enable_requested_services", enable_requested_services, s)
+    run_section(s, "apply_firewall_baseline", apply_firewall_baseline, s)
+    run_section(s, "disable_printing_services", disable_printing_services, s)
+    run_section(s, "verify_environment", verify_environment, s)
+
+    write_summary_report(s)
+    print_final_report(s)
+
+
+def cmd_python(s: Settings) -> None:
+    require_debian_like(s)
+
+    info(s, "Python command start", {"version": VERSION})
+
+    run_section(s, "preflight_apt_health", preflight_apt_health, s)
+    run_section(s, "apt_update", apt_update, s)
+
+    if s.upgrade:
+        run_section(s, "apt_upgrade", apt_upgrade, s)
+
+    run_section(s, "apt_install_python_packages", apt_install_missing, s, PKGS_PY)
+    run_section(s, "ensure_local_bin_path", ensure_local_bin_path, s)
+    run_section(s, "ensure_python_alias_package", ensure_python_alias_package, s)
+    run_section(s, "pipx_ensurepath", pipx_ensurepath, s)
+    run_section(s, "pipx_install_tools", pipx_install_tools, s)
+    run_section(s, "ensure_default_venv", ensure_default_venv, s)
+    run_section(s, "install_venv_libs", install_venv_libs, s)
+    run_section(s, "verify_environment", verify_environment, s)
+
+    write_summary_report(s)
+    print_final_report(s)
+
+
+def cmd_verify(s: Settings) -> None:
+    require_debian_like(s)
+
+    info(s, "Verify command start", {"version": VERSION})
+    run_section(s, "verify_environment", verify_environment, s)
+
+    write_summary_report(s)
+    print_final_report(s)
+
+
+def cmd_report(s: Settings) -> None:
+    ensure_parent(s.report_file)
+    write_summary_report(s)
+    print_final_report(s)
+
+
+# ============================================================================
 # CLI
-# -----------------------------
+# ============================================================================
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="zero_python_provision.py", add_help=True)
-    p.add_argument("--version", action="store_true", help="Print version and exit")
-    p.add_argument("--json", action="store_true", help="Emit JSON to stdout (logs always JSONL)")
-    p.add_argument("--yes", action="store_true", help="Non-interactive apt (-y)")
+    parser = argparse.ArgumentParser(
+        prog="zero_python_provision.py",
+        description="Resilient Debian/Ubuntu Python-first provisioner",
+    )
 
-    sub = p.add_subparsers(dest="cmd", required=False)
+    parser.add_argument("--version", action="store_true", help="Print version and exit")
+    parser.add_argument("--json", action="store_true", dest="json_stdout", help="Emit JSON lines to stdout")
+    parser.add_argument("--yes", action="store_true", help="Pass -y to apt install/upgrade")
+    parser.add_argument("--dry-run", action="store_true", help="Log actions without changing the system")
 
-    # bootstrap
-    b = sub.add_parser("bootstrap", help="Provision packages based on a profile")
-    b.add_argument("--profile", choices=["dev", "secure", "full"], default="dev", help="Package profile")
-    b.add_argument("--upgrade", action="store_true", help="Run apt-get upgrade after update")
-    b.add_argument("--python-link", action="store_true", help="Create python->python3 symlink if python missing")
-    b.add_argument("--pipx-tools", action="store_true", help="Install common pipx tools")
-    b.add_argument("--venv", action="store_true", help="Create default venv (~/python-projects/default)")
-    b.add_argument("--venv-libs", action="store_true", help="Install common libs into default venv")
-    b.add_argument("--enable-services", action="store_true", help="Enable/start services (behavior change)")
-    b.add_argument("--firewall-baseline", action="store_true", help="Apply ufw baseline (behavior change)")
-    b.add_argument("--disable-printing", action="store_true", help="Disable cups services (behavior change)")
+    sub = parser.add_subparsers(dest="cmd", required=False)
 
-    # python-only
-    py = sub.add_parser("python", help="Python-only actions (no system security toggles)")
-    py.add_argument("--upgrade", action="store_true", help="Run apt-get upgrade after update")
-    py.add_argument("--python-link", action="store_true", help="Create python->python3 symlink if python missing")
-    py.add_argument("--pipx-tools", action="store_true", help="Install common pipx tools")
-    py.add_argument("--venv", action="store_true", help="Create default venv")
-    py.add_argument("--venv-libs", action="store_true", help="Install venv libs")
+    b = sub.add_parser("bootstrap", help="Provision packages from a profile")
+    b.add_argument("--profile", choices=["dev", "secure", "full"], default="dev")
+    b.add_argument("--upgrade", action="store_true")
+    b.add_argument("--python-link", action="store_true", help="Install python-is-python3 if python command is missing")
+    b.add_argument("--pipx-tools", action="store_true")
+    b.add_argument("--venv", action="store_true")
+    b.add_argument("--venv-libs", action="store_true")
+    b.add_argument("--enable-services", action="store_true")
+    b.add_argument("--firewall-baseline", action="store_true")
+    b.add_argument("--disable-printing", action="store_true")
 
-    # verify
-    sub.add_parser("verify", help="Show versions/status")
+    py = sub.add_parser("python", help="Python-only install flow")
+    py.add_argument("--upgrade", action="store_true")
+    py.add_argument("--python-link", action="store_true", help="Install python-is-python3 if python command is missing")
+    py.add_argument("--pipx-tools", action="store_true")
+    py.add_argument("--venv", action="store_true")
+    py.add_argument("--venv-libs", action="store_true")
 
-    return p
+    sub.add_parser("verify", help="Verify installed tooling and service status")
+    sub.add_parser("report", help="Print/write current run summary only")
+
+    return parser
 
 
 def make_settings(args: argparse.Namespace) -> Settings:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"{APP_ID}_{RUN_ID}.jsonl"
-
-    profile = getattr(args, "profile", "dev")
+    if not getattr(args, "dry_run", False):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
     return Settings(
         yes=bool(args.yes),
-        json=bool(args.json),
+        json_stdout=bool(args.json_stdout),
+        dry_run=bool(args.dry_run),
+        profile=str(getattr(args, "profile", "dev")),
         upgrade=bool(getattr(args, "upgrade", False)),
-        profile=str(profile),
         python_link=bool(getattr(args, "python_link", False)),
         pipx_tools=bool(getattr(args, "pipx_tools", False)),
         venv=bool(getattr(args, "venv", False)),
@@ -429,90 +999,62 @@ def make_settings(args: argparse.Namespace) -> Settings:
         enable_services=bool(getattr(args, "enable_services", False)),
         firewall_baseline=bool(getattr(args, "firewall_baseline", False)),
         disable_printing=bool(getattr(args, "disable_printing", False)),
-        log_file=log_file,
+        log_file=DEFAULT_LOG_FILE,
+        report_file=DEFAULT_REPORT_FILE,
     )
 
 
-def cmd_bootstrap(s: Settings) -> None:
-    require_debian_like(s)
-    info(s, f"{APP_NAME} bootstrap", {"version": VERSION, "profile": s.profile})
-
-    apt_update(s)
-    if s.upgrade:
-        apt_upgrade(s)
-
-    pkgs = profile_packages(s.profile)
-    apt_install_missing(s, pkgs)
-
-    ensure_local_bin_path(s)
-    pipx_ensurepath(s)
-    pip_user_upgrade(s)
-
-    ensure_python_symlink(s)
-    pipx_install_tools(s)
-    ensure_default_venv(s)
-    install_venv_libs(s)
-
-    enable_services(s)
-    firewall_baseline(s)
-    disable_printing(s)
-
-    verify(s)
-    info(s, "Bootstrap complete", {"log": str(s.log_file)})
-
-
-def cmd_python(s: Settings) -> None:
-    require_debian_like(s)
-    info(s, f"{APP_NAME} python", {"version": VERSION})
-
-    apt_update(s)
-    if s.upgrade:
-        apt_upgrade(s)
-
-    apt_install_missing(s, PKGS_PY)
-    ensure_local_bin_path(s)
-    pipx_ensurepath(s)
-    pip_user_upgrade(s)
-
-    ensure_python_symlink(s)
-    pipx_install_tools(s)
-    ensure_default_venv(s)
-    install_venv_libs(s)
-
-    verify(s)
-    info(s, "Python setup complete", {"log": str(s.log_file)})
-
-
-def cmd_verify(s: Settings) -> None:
-    require_debian_like(s)
-    verify(s)
-    info(s, "Verify complete", {"log": str(s.log_file)})
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
     if args.version:
-        print(f"{APP_NAME} {VERSION} — suite: {SUITE_NAME} ({SUITE_ID})")
+        print(f"{APP_NAME} {VERSION}")
         return 0
 
-    s = make_settings(args)
+    settings = make_settings(args)
 
-    # default to bootstrap dev if no cmd
-    cmd = args.cmd or "bootstrap"
-    if cmd == "bootstrap":
-        cmd_bootstrap(s)
-    elif cmd == "python":
-        cmd_python(s)
-    elif cmd == "verify":
-        cmd_verify(s)
-    else:
-        err(s, f"Unknown command: {cmd}")
-        return 2
+    try:
+        cmd = args.cmd or "bootstrap"
+        if cmd == "bootstrap":
+            cmd_bootstrap(settings)
+        elif cmd == "python":
+            cmd_python(settings)
+        elif cmd == "verify":
+            cmd_verify(settings)
+        elif cmd == "report":
+            cmd_report(settings)
+        else:
+            err(settings, f"Unknown command: {cmd}")
+            write_summary_report(settings)
+            print_final_report(settings)
+            return 2
+    except KeyboardInterrupt:
+        err(settings, "Interrupted by user")
+        write_summary_report(settings)
+        print_final_report(settings)
+        return 130
+    except SystemExit:
+        raise
+    except Exception as exc:
+        err(
+            settings,
+            "Fatal exception in main",
+            {
+                "exception": repr(exc),
+                "traceback": traceback.format_exc(),
+            },
+        )
+        write_summary_report(settings)
+        print_final_report(settings)
+        return 1
 
-    return 0
+    return 0 if not STATE.errors else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
