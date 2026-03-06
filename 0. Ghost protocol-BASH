@@ -1,40 +1,73 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
 # ---------------------------
-# Ghost Protocol 00 (Topper)
+# Ghost Protocol 00 (Launcher Topper Only)
 # ---------------------------
 ghost_protocol() {
-  local countdown="${1:-5}"   # seconds
-  local rows="${2:-10}"       # >=10 recommended
-  local cols="${3:-64}"       # width per line
+  local countdown="${1:-10}"   # default 10 seconds
+  local pages="${2:-5}"        # default 5 full pages
+  local cols="${3:-0}"         # 0 = auto terminal width
 
-  local GREEN="\033[0;32m"
-  local RESET="\033[0m"
+  local GREEN=$'\033[0;32m'
+  local RESET=$'\033[0m'
 
-  # clear screen
-  clear
+  local term_lines term_cols rows_per_page
+  term_lines="$(tput lines 2>/dev/null || printf '24')"
+  term_cols="$(tput cols 2>/dev/null || printf '80')"
 
-  printf "${GREEN}Initializing Ghost Protocol… It will begin in %s seconds.${RESET}\n" "$countdown"
+  if [ "$cols" -le 0 ] 2>/dev/null; then
+    cols="$term_cols"
+  fi
+
+  if [ "$cols" -lt 32 ]; then
+    cols=32
+  fi
+
+  rows_per_page=$(( term_lines - 4 ))
+  if [ "$rows_per_page" -lt 10 ]; then
+    rows_per_page=10
+  fi
+
+  command -v clear >/dev/null 2>&1 && clear || printf '\033[2J\033[H'
+
+  printf '%b\n' "${GREEN}Initializing Ghost Protocol... It will begin in ${countdown} seconds.${RESET}"
   sleep 0.6
 
   local i
   for (( i=countdown; i>=1; i-- )); do
-    printf "${GREEN}%s...${RESET}\n" "$i"
+    command -v clear >/dev/null 2>&1 && clear || printf '\033[2J\033[H'
+    printf '%b\n' "${GREEN}Initializing Ghost Protocol... It will begin in ${countdown} seconds.${RESET}"
+    printf '%b\n' "${GREEN}${i}...${RESET}"
     sleep 1
   done
 
-  printf "${GREEN}Initializing Ghost Protocol...${RESET}\n"
-  sleep 0.3
+  printf '%b\n' "${GREEN}Initializing Ghost Protocol...${RESET}"
+  sleep 0.4
 
-  # print rows of binary strings
-  for (( i=1; i<=rows; i++ )); do
-    line=$(tr -dc '01' < /dev/urandom | head -c "$cols")
-    printf "${GREEN}%s${RESET}\n" "$line"
+  local page row line
+  for (( page=1; page<=pages; page++ )); do
+    command -v clear >/dev/null 2>&1 && clear || printf '\033[2J\033[H'
+    printf '%b\n' "${GREEN}Ghost Protocol Page ${page}/${pages}${RESET}"
+    printf '%b\n' "${GREEN}$(printf '%*s' "$cols" '' | tr ' ' '=')${RESET}"
+
+    for (( row=1; row<=rows_per_page; row++ )); do
+      line="$(tr -dc '01' < /dev/urandom | head -c "$cols")"
+      printf '%b\n' "${GREEN}${line}${RESET}"
+    done
+
+    printf '\n'
+    sleep 0.8
   done
 
-  printf "\n"
+  command -v clear >/dev/null 2>&1 && clear || printf '\033[2J\033[H'
 }
 
-# call topper
-ghost_protocol 5 10 64
+# Run topper BEFORE generating installer file.
+# This affects only the launcher shell, not the generated installer.
+ghost_protocol 10 5 0
+
 cat > elliot_top50_install.sh <<'EOF'
 #!/usr/bin/env bash
 # Elliot — Top 50 Install Stack (Ubuntu 24.04+)
@@ -44,7 +77,7 @@ cat > elliot_top50_install.sh <<'EOF'
 # Usage:
 #   chmod +x elliot_top50_install.sh
 #   ./elliot_top50_install.sh
-#c
+#
 # Controls:
 #   LOG_DIR=~/.local/share/elliot-installer
 
@@ -78,7 +111,6 @@ trap 'log "INTERRUPTED (Ctrl+C). Exiting."; exit 130' INT
 need_sudo() { sudo -v || return 1; }
 
 retry() {
-  # retry <attempts> <sleep_seconds> -- command...
   local attempts="$1"; shift
   local delay="$1"; shift
   local n=1
@@ -116,14 +148,12 @@ log "Log file: $LOG_FILE"
 run_block "sudo auth" need_sudo
 run_block "apt update" apt_update
 
-# Foundation (provides add-apt-repository tooling)
 run_block "foundation: certs/keys/download/build" apt_install \
-  coreutils ca-certificates gnupg software-properties-common curl wget build-essential unzip p7zip-full
+  coreutils ca-certificates gnupg software-properties-common curl wget build-essential unzip p7zip-full git
 
 run_block "enable universe" ensure_universe
 run_block "apt update (post-universe)" apt_update
 
-# ---------- TOP-50 installs ----------
 run_block "TOP50: python baseline" apt_install python3 python3-venv python3-pip pipx
 run_block "TOP50: terminal power" apt_install tmux ripgrep fd-find jq bat fzf tree
 run_block "TOP50: monitors + debug" apt_install btop htop iotop ncdu lsof strace gdb
@@ -141,12 +171,10 @@ run_block "TOP50: host controls" bash -lc '
 ' || true
 
 run_block "TOP50: opensnitch + ui" bash -lc '
-  sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y opensnitch python3-opensnitch-ui || \
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y opensnitch python3-opensnitch-ui
   sudo systemctl enable --now opensnitchd >/dev/null 2>&1 || true
 ' || true
 
-# VS Code repo + install
 run_block "TOP50: vscode repo + install code" bash -lc '
   command -v code >/dev/null 2>&1 && exit 0
   sudo install -d -m 0755 /etc/apt/keyrings
@@ -156,7 +184,6 @@ run_block "TOP50: vscode repo + install code" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y code
 ' || true
 
-# Opera repo + install
 run_block "TOP50: opera repo + install opera-stable" bash -lc '
   command -v opera >/dev/null 2>&1 && exit 0
   wget -qO- https://deb.opera.com/archive.key | gpg --dearmor | sudo dd of=/usr/share/keyrings/opera-browser.gpg status=none
@@ -165,7 +192,6 @@ run_block "TOP50: opera repo + install opera-stable" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y opera-stable
 ' || true
 
-# Flatpak + Tor launcher
 run_block "TOP50: flatpak + flathub" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y flatpak gnome-software-plugin-flatpak || \
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y flatpak
@@ -187,8 +213,6 @@ run_block "TOP50: iphone (libimobiledevice/usbmuxd/ifuse)" bash -lc '
 ' || true
 
 run_block "TOP50: rsync" apt_install rsync
-
-# ---------- Extras (optional) ----------
 run_block "EXTRA: can-utils" apt_install can-utils
 
 run_block "EXTRA: vehicle python libs (python-can + obd) in venv" bash -lc '
@@ -209,18 +233,9 @@ run_block "EXTRA: proton vpn repo + apps" bash -lc '
   sudo env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt-get install -y proton-vpn-cli || true
 ' || true
 
-run_block "TOP50: metasploit (rapid7 msfinstall)" bash -lc '
-  command -v msfconsole >/dev/null 2>&1 && exit 0
-  cd /tmp
-  curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfinstall.erb > msfinstall
-  chmod 755 msfinstall
-  sudo ./msfinstall
-' || true
-
 # ---------- Verification report ----------
 run_block "TOP50 verification report" bash -lc '
   declare -A CHECKS=(
-    [metasploit-framework]="command -v msfconsole"
     [code]="command -v code"
     [opera-stable]="command -v opera"
     [flatpak]="command -v flatpak"
@@ -272,7 +287,8 @@ run_block "TOP50 verification report" bash -lc '
     [ifuse]="command -v ifuse"
   )
 
-  total=0; ok=0
+  total=0
+  ok=0
   echo "=== TOP50 CHECK ==="
   for pkg in "${!CHECKS[@]}"; do
     total=$((total+1))
