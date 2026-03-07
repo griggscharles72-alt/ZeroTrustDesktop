@@ -1,72 +1,98 @@
 #!/usr/bin/env python3
 """
-ZTD — 09. FIREWALL ENGINE (nftables baseline + lockout safety)
-Version: 0.9.0
-Stage: 09 (Firewall engine layer)
+README
+======
 
-DEFAULT (SAFE)
-  - Installs firewall tooling if missing
-  - Captures snapshots
-  - Writes a conservative nftables ruleset file
-  - DOES NOT APPLY anything unless --apply
+Filename:
+    ztd_09_firewall_engine.py
 
-APPLY (EXPLICIT)
-  --apply                 apply nft ruleset
-  --allow-ssh             allow inbound SSH (tcp/22)
-  --ssh-port <port>       change SSH port allowance (default 22)
-  --auto-rollback-sec N   schedule rollback in N seconds after apply (default 90)
-  --cancel-rollback       cancel any scheduled rollback from this stage
+Project:
+    Zero Trust Desktop (ZTD)
 
-SAFETY MODEL
-  - Never flushes UFW here.
-  - Does NOT disable UFW automatically.
-  - Uses a timed rollback fuse when applying nft rules.
-  - Stores backups under ~/.local/state/zero-trust-desktop/ztd_09/snapshots/<run_id>/
+Stage:
+    09 — Firewall Engine
 
-NOTES
-  - If you are already using UFW as your main firewall, you may choose to never run --apply here.
-    This stage still gives you tooling + evidence + a baseline nft config you can activate later.
+Purpose
+-------
+This stage prepares a conservative nftables baseline with rollback safety.
+
+Default behavior:
+    - Verifies Debian/Ubuntu-style platform
+    - Updates apt metadata
+    - Installs required firewall tooling if missing
+    - Captures firewall/network snapshots
+    - Writes a baseline nftables ruleset
+    - Does NOT apply rules unless --apply is explicitly provided
+
+Apply behavior:
+    --apply                 Apply nftables ruleset
+    --allow-ssh             Allow inbound SSH
+    --ssh-port PORT         SSH port to allow (default: 22)
+    --auto-rollback-sec N   Schedule rollback fuse after apply (default: 90)
+    --cancel-rollback       Cancel previously scheduled rollback unit(s)
+
+Safety notes
+------------
+- This stage does not disable or reconfigure UFW.
+- This stage writes an nftables ruleset file even if you never apply it.
+- When applying, a timed rollback fuse is scheduled first.
+- Snapshots and logs are written under:
+      ~/.local/state/zero-trust-desktop/ztd_09/
+
+Design
+------
+- Safe by default
+- Auditable
+- Idempotent
+- Location independent
+- Best-effort snapshots
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Sequence
 
 
 APP_NAME = "Zero Trust Desktop"
 STAGE_NAME = "09. FIREWALL ENGINE"
 STAGE_ID = "ztd_09_firewall_engine"
-VERSION = "0.9.0"
+VERSION = "1.0.0"
 
-HOME = Path.home()
-STATE_DIR = HOME / ".local" / "state" / "zero-trust-desktop" / "ztd_09"
-LOG_DIR = STATE_DIR / "log"
-SNAP_DIR = STATE_DIR / "snapshots"
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-LOG_FILE = LOG_DIR / f"{STAGE_ID}_{RUN_ID}.jsonl"
-SNAPSHOT_ROOT = SNAP_DIR / RUN_ID
-RULESET_FILE = SNAPSHOT_ROOT / "nft_ztd_baseline.nft"
-ROLLBACK_FILE = SNAPSHOT_ROOT / "rollback.sh"
-
-PKGS = [
+REQUIRED_PACKAGES = [
     "nftables",
     "iptables",
-    "iptables-persistent",
 ]
 
 
-@dataclass
+@dataclass(frozen=True)
+class Event:
+    ts: str
+    level: str
+    msg: str
+    data: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class AppPaths:
+    state_dir: Path
+    log_dir: Path
+    snapshot_dir: Path
+    log_file: Path
+    ruleset_file: Path
+    rollback_script: Path
+    rollback_unit_file: Path
+
+
+@dataclass(frozen=True)
 class Settings:
     yes: bool
     json_stdout: bool
@@ -75,16 +101,7 @@ class Settings:
     ssh_port: int
     auto_rollback_sec: int
     cancel_rollback: bool
-    log_file: Path
-    snapshot_root: Path
-
-
-@dataclass
-class Event:
-    ts: str
-    level: str
-    msg: str
-    data: Optional[dict] = None
+    paths: AppPaths
 
 
 def now_ts() -> str:
@@ -95,109 +112,191 @@ def have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def emit(s: Settings, ev: Event) -> None:
-    if s.json_stdout:
-        print(json.dumps(asdict(ev), ensure_ascii=False))
+def run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def build_paths() -> AppPaths:
+    rid = run_id()
+    state_dir = Path.home() / ".local" / "state" / "zero-trust-desktop" / "ztd_09"
+    log_dir = state_dir / "log"
+    snapshot_dir = state_dir / "snapshots" / rid
+    return AppPaths(
+        state_dir=state_dir,
+        log_dir=log_dir,
+        snapshot_dir=snapshot_dir,
+        log_file=log_dir / f"{STAGE_ID}_{rid}.jsonl",
+        ruleset_file=snapshot_dir / "nft_ztd_baseline.nft",
+        rollback_script=snapshot_dir / "rollback.sh",
+        rollback_unit_file=state_dir / "rollback_unit_name.txt",
+    )
+
+
+def emit(settings: Settings, level: str, msg: str, data: Optional[dict] = None) -> None:
+    ev = Event(ts=now_ts(), level=level, msg=msg, data=data)
+    payload = json.dumps(asdict(ev), ensure_ascii=False)
+
+    if settings.json_stdout:
+        print(payload)
     else:
         print(f"[{ev.ts}] {ev.level}: {ev.msg}")
-    s.log_file.parent.mkdir(parents=True, exist_ok=True)
-    with s.log_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(ev), ensure_ascii=False) + "\n")
+
+    settings.paths.log_dir.mkdir(parents=True, exist_ok=True)
+    with settings.paths.log_file.open("a", encoding="utf-8") as fh:
+        fh.write(payload + "\n")
 
 
-def info(s: Settings, msg: str, data: Optional[dict] = None) -> None:
-    emit(s, Event(ts=now_ts(), level="INFO", msg=msg, data=data))
+def info(settings: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(settings, "INFO", msg, data)
 
 
-def warn(s: Settings, msg: str, data: Optional[dict] = None) -> None:
-    emit(s, Event(ts=now_ts(), level="WARN", msg=msg, data=data))
+def warn(settings: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(settings, "WARN", msg, data)
 
 
-def error(s: Settings, msg: str, data: Optional[dict] = None) -> None:
-    emit(s, Event(ts=now_ts(), level="ERROR", msg=msg, data=data))
+def error(settings: Settings, msg: str, data: Optional[dict] = None) -> None:
+    emit(settings, "ERROR", msg, data)
 
 
-def run(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
-    info(s, "$ " + " ".join(cmd))
-    p = subprocess.run(cmd, text=True, capture_output=True)
-    if check and p.returncode != 0:
-        error(s, "Command failed", {"rc": p.returncode, "cmd": cmd, "stderr": (p.stderr or "").strip()})
-        raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
-    return p.returncode, p.stdout, p.stderr
+def run_cmd(
+    settings: Settings,
+    cmd: Sequence[str],
+    *,
+    check: bool = True,
+    use_sudo: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    full_cmd = ["sudo", *cmd] if use_sudo else list(cmd)
+    info(settings, "$ " + " ".join(full_cmd))
+
+    proc = subprocess.run(
+        full_cmd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if check and proc.returncode != 0:
+        error(
+            settings,
+            "Command failed",
+            {
+                "rc": proc.returncode,
+                "cmd": full_cmd,
+                "stdout": (proc.stdout or "").strip(),
+                "stderr": (proc.stderr or "").strip(),
+            },
+        )
+        raise RuntimeError(f"Command failed: {' '.join(full_cmd)} (rc={proc.returncode})")
+
+    return proc
 
 
-def sudo(s: Settings, cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
-    return run(s, ["sudo"] + cmd, check=check)
+def shell_capture(command: str) -> str:
+    proc = subprocess.run(
+        ["bash", "-lc", command],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return (proc.stdout or proc.stderr or "").strip()
 
 
-def require_debian_like(s: Settings) -> None:
-    if not (Path("/etc/os-release").exists() and have("apt-get") and have("dpkg")):
-        error(s, "Unsupported platform. Debian/Ubuntu with apt-get/dpkg required.")
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content.rstrip() + "\n", encoding="utf-8", errors="ignore")
+
+
+def require_supported_platform(settings: Settings) -> None:
+    ok = Path("/etc/os-release").exists() and have("apt-get") and have("dpkg")
+    if not ok:
+        error(settings, "Unsupported platform. Debian/Ubuntu with apt-get/dpkg required.")
+        raise SystemExit(2)
+
+
+def validate_args(settings: Settings) -> None:
+    if not (1 <= settings.ssh_port <= 65535):
+        error(settings, "Invalid SSH port", {"ssh_port": settings.ssh_port})
+        raise SystemExit(2)
+
+    if settings.auto_rollback_sec < 5:
+        error(settings, "Rollback fuse must be at least 5 seconds", {"seconds": settings.auto_rollback_sec})
         raise SystemExit(2)
 
 
 def dpkg_installed(pkg: str) -> bool:
-    p = subprocess.run(["dpkg", "-s", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return p.returncode == 0
+    proc = subprocess.run(
+        ["dpkg", "-s", pkg],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.returncode == 0
 
 
-def apt_update(s: Settings) -> None:
-    args = ["apt-get", "update"]
-    if s.yes:
-        args.append("-y")
-    sudo(s, args)
+def apt_update(settings: Settings) -> None:
+    cmd = ["apt-get", "update"]
+    run_cmd(settings, cmd, use_sudo=True)
 
 
-def apt_install_missing(s: Settings, pkgs: List[str]) -> None:
-    missing = [p for p in pkgs if not dpkg_installed(p)]
-    for p in pkgs:
-        info(s, f"Already installed: {p}" if p not in missing else f"Installing missing package: {p}")
+def apt_install_missing(settings: Settings, packages: Sequence[str]) -> None:
+    missing = [pkg for pkg in packages if not dpkg_installed(pkg)]
+
+    for pkg in packages:
+        if pkg in missing:
+            info(settings, f"Installing missing package: {pkg}")
+        else:
+            info(settings, f"Already installed: {pkg}")
+
     if not missing:
         return
-    args = ["apt-get", "install"]
-    if s.yes:
-        args.append("-y")
-    args += missing
-    sudo(s, args)
+
+    cmd = ["apt-get", "install"]
+    if settings.yes:
+        cmd.append("-y")
+    cmd.extend(missing)
+    run_cmd(settings, cmd, use_sudo=True)
 
 
-def cap(cmd: str) -> str:
-    p = subprocess.run(["bash", "-lc", cmd], text=True, capture_output=True)
-    return (p.stdout or p.stderr or "").strip()
-
-
-def write_snapshot(name: str, content: str, root: Path) -> None:
+def capture_snapshots(settings: Settings) -> None:
+    root = settings.paths.snapshot_dir
     root.mkdir(parents=True, exist_ok=True)
-    (root / name).write_text(content + "\n", encoding="utf-8", errors="ignore")
 
+    info(settings, "Capturing firewall snapshots", {"dir": str(root)})
 
-def snapshots(s: Settings) -> None:
-    info(s, "Capturing firewall snapshots", {"dir": str(s.snapshot_root)})
-    write_snapshot("system.txt", f"{platform.system()} {platform.release()} {platform.machine()}\n{sys.version.splitlines()[0]}", s.snapshot_root)
+    system_text = "\n".join(
+        [
+            f"{platform.system()} {platform.release()} {platform.machine()}",
+            sys.version.splitlines()[0],
+        ]
+    )
+    write_text(root / "system.txt", system_text)
 
     if have("ufw"):
-        write_snapshot("ufw_status.txt", cap("ufw status verbose || true"), s.snapshot_root)
+        write_text(root / "ufw_status.txt", shell_capture("ufw status verbose || true"))
 
     if have("nft"):
-        write_snapshot("nft_ruleset_before.txt", cap("sudo nft list ruleset 2>/dev/null || true"), s.snapshot_root)
+        write_text(root / "nft_ruleset_before.txt", shell_capture("sudo nft list ruleset 2>/dev/null || true"))
 
     if have("iptables-save"):
-        write_snapshot("iptables_save_before.txt", cap("sudo iptables-save 2>/dev/null || true"), s.snapshot_root)
+        write_text(root / "iptables_save_before.txt", shell_capture("sudo iptables-save 2>/dev/null || true"))
 
     if have("ss"):
-        write_snapshot("listening_ports.txt", cap("ss -tulnp | sed -n '1,260p' || true"), s.snapshot_root)
+        write_text(root / "listening_ports.txt", shell_capture("ss -tulnp | sed -n '1,260p' || true"))
 
-    info(s, "Snapshots complete", {"dir": str(s.snapshot_root)})
+    info(settings, "Snapshots complete", {"dir": str(root)})
 
 
-def build_ruleset(s: Settings) -> str:
-    ssh_rule = ""
-    if s.allow_ssh:
-        ssh_rule = f"tcp dport {s.ssh_port} accept"
+def build_ruleset(settings: Settings) -> str:
+    optional_rules: list[str] = []
 
-    # Conservative baseline: allow established/related + loopback, allow DHCP client traffic, drop inbound by default.
-    # Outgoing allowed.
-    ruleset = f"""#!/usr/sbin/nft -f
+    if settings.allow_ssh:
+        optional_rules.append(f"    tcp dport {settings.ssh_port} accept")
+
+    optional_block = "\n".join(optional_rules)
+    if optional_block:
+        optional_block = "\n    # Optional SSH\n" + optional_block + "\n"
+
+    return f"""#!/usr/sbin/nft -f
 
 flush ruleset
 
@@ -209,17 +308,13 @@ table inet ztd {{
     iif "lo" accept
     ct state established,related accept
 
-    # DHCP (client)
+    # DHCP client traffic
     udp sport 67 udp dport 68 accept
     udp sport 68 udp dport 67 accept
 
-    # ICMP (debug-friendly)
+    # ICMP
     ip protocol icmp accept
-    ip6 nexthdr ipv6-icmp accept
-
-    # Optional SSH
-    {ssh_rule}
-
+    ip6 nexthdr ipv6-icmp accept{optional_block}
     # Rate-limited logging for drops
     limit rate 6/minute log prefix "ZTD_DROP " flags all
     drop
@@ -235,96 +330,153 @@ table inet ztd {{
     policy accept;
   }}
 }}
-"""
-    # clean blank lines if ssh_rule empty
-    return "\n".join([ln for ln in ruleset.splitlines() if ln.strip() != "" or True])
+""".rstrip() + "\n"
 
 
-def write_rollback_script(s: Settings) -> None:
-    # Restores nft to previous ruleset capture if available, else disables ztd table by flush ruleset.
-    prior = s.snapshot_root / "nft_ruleset_before.txt"
-    body = ""
-    if prior.exists() and prior.read_text(encoding="utf-8", errors="ignore").strip():
-        # Use saved text as a restore by writing it to a temp and nft -f it.
-        body = f"""
-tmp="$(mktemp)"
+def write_ruleset(settings: Settings) -> None:
+    content = build_ruleset(settings)
+    write_text(settings.paths.ruleset_file, content)
+    info(settings, "Ruleset written", {"path": str(settings.paths.ruleset_file)})
+
+
+def write_rollback_script(settings: Settings) -> None:
+    prior_ruleset = settings.paths.snapshot_dir / "nft_ruleset_before.txt"
+
+    if prior_ruleset.exists() and prior_ruleset.read_text(encoding="utf-8", errors="ignore").strip():
+        restore_body = f"""tmp="$(mktemp)"
 cat > "$tmp" <<'EOF'
-{prior.read_text(encoding="utf-8", errors="ignore")}
+{prior_ruleset.read_text(encoding="utf-8", errors="ignore")}
 EOF
 sudo nft -f "$tmp" || true
 rm -f "$tmp"
 """
     else:
-        body = "sudo nft flush ruleset || true\n"
+        restore_body = 'sudo nft flush ruleset || true\n'
 
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
+
 echo "[ZTD 09] rollback start"
-{body}
-echo "[ZTD 09] rollback complete"
+{restore_body}echo "[ZTD 09] rollback complete"
 """
-    ROLLBACK_FILE.write_text(script, encoding="utf-8")
-    ROLLBACK_FILE.chmod(0o755)
-    info(s, "Rollback script written", {"path": str(ROLLBACK_FILE)})
+    write_text(settings.paths.rollback_script, script)
+    settings.paths.rollback_script.chmod(0o755)
+
+    info(settings, "Rollback script written", {"path": str(settings.paths.rollback_script)})
 
 
-def schedule_rollback(s: Settings) -> None:
+def schedule_rollback(settings: Settings) -> None:
     if not have("systemd-run"):
-        warn(s, "systemd-run not found; cannot schedule rollback fuse")
+        warn(settings, "systemd-run not found; rollback fuse not scheduled")
         return
-    unit = f"ztd09-rollback-{RUN_ID}"
-    cmd = f"bash '{ROLLBACK_FILE}'"
-    # Runs rollback after N seconds unless user cancels.
-    sudo(s, ["systemd-run", f"--unit={unit}", f"--on-active={s.auto_rollback_sec}s", "bash", "-lc", cmd], check=False)
-    info(s, "Rollback fuse scheduled", {"unit": unit, "seconds": s.auto_rollback_sec})
+
+    unit_name = f"ztd09-rollback-{run_id()}"
+    cmd = [
+        "systemd-run",
+        f"--unit={unit_name}",
+        f"--on-active={settings.auto_rollback_sec}s",
+        "bash",
+        str(settings.paths.rollback_script),
+    ]
+    proc = run_cmd(settings, cmd, check=False, use_sudo=True)
+
+    if proc.returncode == 0:
+        write_text(settings.paths.rollback_unit_file, unit_name)
+        info(settings, "Rollback fuse scheduled", {"unit": unit_name, "seconds": settings.auto_rollback_sec})
+    else:
+        warn(
+            settings,
+            "Failed to schedule rollback fuse",
+            {
+                "unit": unit_name,
+                "rc": proc.returncode,
+                "stderr": (proc.stderr or "").strip(),
+            },
+        )
 
 
-def cancel_rollbacks(s: Settings) -> None:
+def cancel_rollbacks(settings: Settings) -> None:
     if not have("systemctl"):
+        warn(settings, "systemctl not found; cannot cancel rollback units")
         return
-    # Best-effort: stop any ztd09 rollback units.
-    # We do not rely on exact IDs.
-    info(s, "Cancelling any ztd09 rollback units (best-effort)")
-    subprocess.run(["bash", "-lc", "systemctl list-units --all | grep -E 'ztd09-rollback-' | awk '{print $1}' | xargs -r sudo systemctl stop || true"], check=False)
-    subprocess.run(["bash", "-lc", "systemctl list-units --all | grep -E 'ztd09-rollback-' | awk '{print $1}' | xargs -r sudo systemctl reset-failed || true"], check=False)
+
+    cancelled_any = False
+
+    if settings.paths.rollback_unit_file.exists():
+        unit_name = settings.paths.rollback_unit_file.read_text(encoding="utf-8", errors="ignore").strip()
+        if unit_name:
+            run_cmd(settings, ["systemctl", "stop", unit_name], check=False, use_sudo=True)
+            run_cmd(settings, ["systemctl", "reset-failed", unit_name], check=False, use_sudo=True)
+            cancelled_any = True
+            info(settings, "Cancelled tracked rollback unit", {"unit": unit_name})
+
+    grep_cmd = (
+        r"systemctl list-units --all --plain --no-legend "
+        r"| awk '{print $1}' "
+        r"| grep -E '^ztd09-rollback-' "
+        r"| xargs -r sudo systemctl stop || true"
+    )
+    subprocess.run(["bash", "-lc", grep_cmd], check=False)
+
+    reset_cmd = (
+        r"systemctl list-units --all --plain --no-legend "
+        r"| awk '{print $1}' "
+        r"| grep -E '^ztd09-rollback-' "
+        r"| xargs -r sudo systemctl reset-failed || true"
+    )
+    subprocess.run(["bash", "-lc", reset_cmd], check=False)
+
+    if cancelled_any:
+        try:
+            settings.paths.rollback_unit_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    info(settings, "Rollback cancel pass complete")
 
 
-def apply_ruleset(s: Settings) -> None:
-    if not s.apply:
-        warn(s, "Not applying firewall ruleset (use --apply)")
+def apply_ruleset(settings: Settings) -> None:
+    if not settings.apply:
+        warn(settings, "Ruleset not applied; use --apply to activate it")
         return
+
     if not have("nft"):
-        error(s, "nft not found; cannot apply")
+        error(settings, "nft command not found; cannot apply ruleset")
         raise SystemExit(2)
 
-    # Safety fuse: schedule rollback first, then apply.
-    write_rollback_script(s)
-    schedule_rollback(s)
+    write_rollback_script(settings)
+    schedule_rollback(settings)
 
-    info(s, "Applying nft ruleset", {"file": str(RULESET_FILE)})
-    sudo(s, ["nft", "-f", str(RULESET_FILE)], check=True)
+    info(settings, "Applying nft ruleset", {"file": str(settings.paths.ruleset_file)})
+    run_cmd(settings, ["nft", "-f", str(settings.paths.ruleset_file)], use_sudo=True)
 
-    # Post snapshot
-    write_snapshot("nft_ruleset_after.txt", cap("sudo nft list ruleset 2>/dev/null || true"), s.snapshot_root)
-    info(s, "Firewall apply complete. If everything is OK, cancel rollback with --cancel-rollback.")
+    write_text(
+        settings.paths.snapshot_dir / "nft_ruleset_after.txt",
+        shell_capture("sudo nft list ruleset 2>/dev/null || true"),
+    )
+
+    info(
+        settings,
+        "Firewall apply complete. Cancel rollback when verified.",
+        {"hint": "Run again with --cancel-rollback after validation"},
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="ztd_09_firewall_engine.py")
-    p.add_argument("--yes", action="store_true", help="Non-interactive apt (-y)")
-    p.add_argument("--json", action="store_true", help="Emit JSON to stdout (log file always JSONL)")
+    parser = argparse.ArgumentParser(prog="ztd_09_firewall_engine.py")
+    parser.add_argument("--yes", action="store_true", help="Use non-interactive apt install mode")
+    parser.add_argument("--json", action="store_true", help="Emit JSON events to stdout")
+    parser.add_argument("--apply", action="store_true", help="Apply nftables ruleset")
+    parser.add_argument("--allow-ssh", action="store_true", help="Allow inbound SSH")
+    parser.add_argument("--ssh-port", type=int, default=22, help="SSH port to allow if --allow-ssh is set")
+    parser.add_argument("--auto-rollback-sec", type=int, default=90, help="Rollback fuse delay in seconds")
+    parser.add_argument("--cancel-rollback", action="store_true", help="Cancel scheduled rollback unit(s)")
+    return parser
 
-    p.add_argument("--apply", action="store_true", help="Apply nft ruleset")
-    p.add_argument("--allow-ssh", action="store_true", help="Allow inbound SSH (tcp/22 by default)")
-    p.add_argument("--ssh-port", type=int, default=22, help="SSH port to allow if --allow-ssh")
-    p.add_argument("--auto-rollback-sec", type=int, default=90, help="Rollback fuse delay seconds")
-    p.add_argument("--cancel-rollback", action="store_true", help="Cancel any scheduled rollback unit(s)")
-    return p
 
-
-def main() -> int:
-    args = build_parser().parse_args()
-    s = Settings(
+def build_settings(args: argparse.Namespace) -> Settings:
+    paths = build_paths()
+    return Settings(
         yes=bool(args.yes),
         json_stdout=bool(args.json),
         apply=bool(args.apply),
@@ -332,38 +484,94 @@ def main() -> int:
         ssh_port=int(args.ssh_port),
         auto_rollback_sec=int(args.auto_rollback_sec),
         cancel_rollback=bool(args.cancel_rollback),
-        log_file=LOG_FILE,
-        snapshot_root=SNAPSHOT_ROOT,
+        paths=paths,
     )
 
-    require_debian_like(s)
-    info(s, f"{APP_NAME} — {STAGE_NAME} start", {"version": VERSION, "log": str(s.log_file)})
 
-    SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+def main() -> int:
+    args = build_parser().parse_args()
+    settings = build_settings(args)
 
-    if s.cancel_rollback:
-        cancel_rollbacks(s)
+    settings.paths.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-    info(s, "[1] apt update")
-    apt_update(s)
+    require_supported_platform(settings)
+    validate_args(settings)
 
-    info(s, "[2] install firewall tooling (idempotent)")
-    apt_install_missing(s, PKGS)
+    info(
+        settings,
+        f"{APP_NAME} — {STAGE_NAME} start",
+        {
+            "version": VERSION,
+            "log_file": str(settings.paths.log_file),
+            "snapshot_dir": str(settings.paths.snapshot_dir),
+        },
+    )
 
-    info(s, "[3] snapshots")
-    snapshots(s)
+    if settings.cancel_rollback:
+        info(settings, "[0] cancel rollback units")
+        cancel_rollbacks(settings)
 
-    info(s, "[4] write nft ruleset file")
-    ruleset = build_ruleset(s)
-    RULESET_FILE.write_text(ruleset, encoding="utf-8")
-    info(s, "Ruleset written", {"path": str(RULESET_FILE)})
+    info(settings, "[1] apt update")
+    apt_update(settings)
 
-    info(s, "[5] apply (optional)")
-    apply_ruleset(s)
+    info(settings, "[2] install required packages")
+    apt_install_missing(settings, REQUIRED_PACKAGES)
 
-    info(s, f"{STAGE_NAME} complete", {"snapshot_dir": str(SNAPSHOT_ROOT), "log": str(LOG_FILE)})
+    info(settings, "[3] capture snapshots")
+    capture_snapshots(settings)
+
+    info(settings, "[4] write nft ruleset")
+    write_ruleset(settings)
+
+    info(settings, "[5] apply ruleset (optional)")
+    apply_ruleset(settings)
+
+    info(
+        settings,
+        f"{STAGE_NAME} complete",
+        {
+            "log_file": str(settings.paths.log_file),
+            "snapshot_dir": str(settings.paths.snapshot_dir),
+            "ruleset_file": str(settings.paths.ruleset_file),
+        },
+    )
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# =============================================================================
+# INSTRUCTIONS
+# =============================================================================
+# Save as:
+#   ztd_09_firewall_engine.py
+#
+# Make executable:
+#   chmod +x ztd_09_firewall_engine.py
+#
+# Run in safe/report mode:
+#   ./ztd_09_firewall_engine.py --yes
+#
+# Run in safe/report mode with JSON stdout:
+#   ./ztd_09_firewall_engine.py --yes --json
+#
+# Apply baseline nftables rules with rollback fuse:
+#   ./ztd_09_firewall_engine.py --yes --apply
+#
+# Apply baseline and allow SSH on default port 22:
+#   ./ztd_09_firewall_engine.py --yes --apply --allow-ssh
+#
+# Apply baseline and allow SSH on a custom port:
+#   ./ztd_09_firewall_engine.py --yes --apply --allow-ssh --ssh-port 2222
+#
+# Apply with a longer rollback fuse:
+#   ./ztd_09_firewall_engine.py --yes --apply --auto-rollback-sec 180
+#
+# Cancel scheduled rollback after verifying connectivity:
+#   ./ztd_09_firewall_engine.py --cancel-rollback
+#
+# Signature:
+#   ZTD Stage 09 / professional rewrite / safe-default / audit-first
+# =============================================================================
