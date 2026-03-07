@@ -6,18 +6,6 @@ README
 Filename:
     07_posture_hardening.py
 
-Run it with:
-
-chmod +x 07_posture_hardening.py
-./07_posture_hardening.py
-
-And if you want the apply pass:
-
-chmod +x 07_posture_hardening.py
-./07_posture_hardening.py --yes --apply-sysctl --apply-journald --apply-timesync
-
-This is the right update for what your last run exposed.
-
 Purpose:
     Zero Trust Desktop (ZTD) Stage 07.
     Produce a posture report first, then optionally apply conservative,
@@ -97,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -185,7 +174,7 @@ def have(cmd: str) -> bool:
 
 
 def cleaned_env() -> Dict[str, str]:
-    env = dict(__import__("os").environ)
+    env = dict(os.environ)
     for key in [
         "BASH_ENV",
         "ENV",
@@ -198,13 +187,6 @@ def cleaned_env() -> Dict[str, str]:
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
     return env
-
-
-def is_ignorable_stderr(stderr: str) -> bool:
-    s = (stderr or "").strip()
-    if not s:
-        return True
-    return any(pattern in s for pattern in IGNORABLE_STDERR_PATTERNS)
 
 
 def filter_stderr(stderr: str) -> str:
